@@ -1,0 +1,35 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy and build on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_KEY: ${{ secrets.EC2_SSH_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          # Write SSH key
+          echo "$EC2_KEY" > key.pem
+          chmod 600 key.pem
+
+          # Build on EC2 and restart service
+          ssh -i key.pem -o StrictHostKeyChecking=no ec2-user@$EC2_HOST "
+            cd ~/oracle && \
+            git pull && \
+            source ~/.cargo/env && \
+            cargo build --release && \
+            sudo systemctl stop joyride-oracle || true && \
+            sudo cp target/release/joyride-oracle /usr/local/bin/ && \
+            sudo systemctl start joyride-oracle && \
+            echo 'Deployment complete' && \
+            sudo systemctl status joyride-oracle --no-pager
+          "

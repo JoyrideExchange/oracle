@@ -1,0 +1,15 @@
+[Unit]
+Description=Joyride Oracle Service
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+ExecStart=/usr/local/bin/joyride-oracle
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+Environment=ORACLE_BIND_ADDR=0.0.0.0:8083
+
+[Install]
+WantedBy=multi-user.target

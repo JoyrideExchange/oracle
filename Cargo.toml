@@ -1,0 +1,50 @@
+# Cargo.toml - Oracle service for Joyride exchange
+#
+# This service provides price data from Pyth Network for:
+# - Real-time spot prices (for risk engine consumption)
+# - TWAP calculation for settlement pricing
+#
+# Phase 0: Pyth Hermes (HTTP/SSE streaming)
+# Phase 1+: Pyth Pro (lower latency)
+
+[package]
+name = "joyride-oracle"
+version = "0.1.0"
+edition = "2021"
+description = "Price oracle service using Pyth Network"
+license = "MIT"
+repository = "https://github.com/joyride-exchange/oracle"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for Pyth Hermes API
+reqwest = { version = "0.12", features = ["json"] }
+
+# SSE streaming
+eventsource-client = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Async utilities
+futures-util = "0.3"
+
+# WebSocket server
+tokio-tungstenite = "0.24"
+
+[dev-dependencies]
+tokio-test = "0.4"
