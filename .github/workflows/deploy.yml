@@ -15,7 +15,6 @@ jobs:
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_KEY: ${{ secrets.EC2_SSH_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           # Write SSH key
           echo "$EC2_KEY" > key.pem
