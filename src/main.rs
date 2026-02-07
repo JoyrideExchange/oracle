@@ -26,30 +26,35 @@ fn server_addr() -> String {
 /// TWAP window duration in seconds (30 minutes).
 const TWAP_WINDOW_SECS: i64 = 30 * 60;
 
+/// Round epoch anchor — must match the server's ROUND_EPOCH (Jan 1, 2025 08:00 UTC).
+/// All round boundaries are EPOCH + N * ROUND_DURATION.
+const ROUND_EPOCH_SECS: i64 = 1_735_718_400; // 2025-01-01T08:00:00Z
+
+/// Read ROUND_DURATION_HOURS from env (default 24), return duration in seconds.
+fn round_duration_secs() -> i64 {
+    let hours: i64 = std::env::var("ROUND_DURATION_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    hours * 3600
+}
+
 /// Calculate settlement timing info.
-/// Settlement is at 00:00 UTC daily, TWAP window opens at 23:30 UTC.
+/// Settlement happens at round boundaries anchored to ROUND_EPOCH.
 fn calculate_settlement_info(now_secs: i64) -> SettlementInfo {
-    // Seconds per day
-    const SECS_PER_DAY: i64 = 24 * 60 * 60;
+    let duration = round_duration_secs();
 
-    // Current time of day in seconds
-    let time_of_day = now_secs % SECS_PER_DAY;
+    let elapsed = now_secs - ROUND_EPOCH_SECS;
+    let rounds_elapsed = elapsed.div_euclid(duration);
+    let next_settlement = ROUND_EPOCH_SECS + (rounds_elapsed + 1) * duration;
+    let seconds_to_settlement = next_settlement - now_secs;
 
-    // Next settlement is at midnight UTC
-    let seconds_to_settlement = if time_of_day == 0 {
-        0 // It's exactly midnight
-    } else {
-        SECS_PER_DAY - time_of_day
-    };
-
-    let next_settlement = now_secs + seconds_to_settlement;
-
-    // TWAP window opens 30 minutes before settlement
-    let twap_window_start = next_settlement - TWAP_WINDOW_SECS;
+    // TWAP window opens 30 minutes before settlement (or at round start for short rounds)
+    let twap_window_start = next_settlement - TWAP_WINDOW_SECS.min(duration);
     let seconds_to_twap_window = (twap_window_start - now_secs).max(0);
 
-    // We're in the TWAP window if less than 30 minutes to settlement
-    let in_twap_window = seconds_to_settlement <= TWAP_WINDOW_SECS && seconds_to_settlement > 0;
+    let in_twap_window = seconds_to_settlement <= TWAP_WINDOW_SECS.min(duration)
+        && seconds_to_settlement > 0;
 
     SettlementInfo {
         next_settlement,
@@ -65,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().init();
 
     info!("Starting Joyride Oracle Service");
+    let round_hours = round_duration_secs() / 3600;
+    info!("Round duration: {} hour(s)", round_hours);
     info!(
         "Tracking assets: {}",
         ASSETS

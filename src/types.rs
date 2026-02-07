@@ -124,10 +124,10 @@ pub struct TwapPreview {
 /// Settlement timing information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettlementInfo {
-    /// Unix timestamp of next settlement (00:00 UTC)
+    /// Unix timestamp of next settlement (round boundary)
     pub next_settlement: i64,
 
-    /// Unix timestamp when TWAP window opens (23:30 UTC)
+    /// Unix timestamp when TWAP window opens (30 min before settlement)
     pub twap_window_start: i64,
 
     /// Seconds until TWAP window opens

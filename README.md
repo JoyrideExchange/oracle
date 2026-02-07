@@ -28,7 +28,14 @@ The service starts a WebSocket server on port 8083 and begins streaming prices f
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `ORACLE_BIND_ADDR` | `0.0.0.0:8083` | WebSocket server bind address |
+| `ROUND_DURATION_HOURS` | `24` | Round duration in hours (must match server) |
 | `RUST_LOG` | `info` | Log level (debug, info, warn, error) |
+
+## Integration
+
+The Joyride server connects to the oracle WebSocket and uses the rolling 30-minute TWAP as the settlement price at round expiry. Clients discover the oracle URL from the server's `GET /api/v1/config` endpoint and connect directly for real-time display.
+
+Set `ORACLE_WS_URL` in the server's `.env` to point to this service (default `ws://127.0.0.1:8083`). Clients do not need a separate oracle URL.
 
 ## Library Usage
 
@@ -103,10 +110,10 @@ Connect to `ws://<host>:8083` to receive real-time events.
 
 ## Settlement Timing
 
-- **Settlement**: Daily at 00:00 UTC
-- **TWAP Window**: 23:30 - 00:00 UTC (30 minutes before settlement)
+- **Settlement**: Every `ROUND_DURATION_HOURS` hours, anchored to Jan 1, 2025 08:00 UTC (same epoch as the server)
+- **TWAP Window**: 30 minutes before each settlement (or full round for rounds shorter than 30 min)
 - **Sample Rate**: 1 sample per second
-- **Minimum Coverage**: 90% (1,620 of 1,800 samples required)
+- **Minimum Coverage**: 90% (1,620 of 1,800 samples required for a 30-min window)
 
 ## Architecture
 
