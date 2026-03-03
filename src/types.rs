@@ -117,27 +117,6 @@ pub struct TwapPreview {
     /// Coverage percentage (0.0 to 1.0)
     pub coverage: f64,
 
-    /// Whether we're in the active settlement window (T-30 to T-0)
-    pub in_settlement_window: bool,
-}
-
-/// Settlement timing information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SettlementInfo {
-    /// Unix timestamp of next settlement (round boundary)
-    pub next_settlement: i64,
-
-    /// Unix timestamp when TWAP window opens (30 min before settlement)
-    pub twap_window_start: i64,
-
-    /// Seconds until TWAP window opens
-    pub seconds_to_twap_window: i64,
-
-    /// Seconds until settlement
-    pub seconds_to_settlement: i64,
-
-    /// Whether we're currently in the TWAP window
-    pub in_twap_window: bool,
 }
 
 /// Events emitted by the oracle service.
@@ -152,9 +131,6 @@ pub enum OracleEvent {
 
     /// Rolling TWAP preview (every few seconds)
     TwapPreview(TwapPreview),
-
-    /// Settlement timing update (every second)
-    Settlement(SettlementInfo),
 
     /// Connected to Pyth
     Connected,

@@ -23,7 +23,8 @@ jobs:
           # Build on EC2 and restart service
           ssh -i key.pem -o StrictHostKeyChecking=no ec2-user@$EC2_HOST "
             cd ~/oracle && \
-            git pull && \
+            git fetch origin && \
+            git reset --hard origin/main && \
             source ~/.cargo/env && \
             cargo build --release && \
             sudo systemctl stop joyride-oracle || true && \

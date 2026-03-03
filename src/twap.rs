@@ -155,7 +155,7 @@ impl TwapCalculator {
 
     /// Calculate a rolling TWAP preview (what settlement price would be if it happened now).
     /// This uses the current time as the window end.
-    pub fn calculate_preview(&self, symbol: &str, current_time: i64, in_settlement_window: bool) -> Option<TwapPreview> {
+    pub fn calculate_preview(&self, symbol: &str, current_time: i64) -> Option<TwapPreview> {
         let samples = self.samples.get(symbol)?;
         let window_start = current_time - self.window_secs;
 
@@ -171,7 +171,6 @@ impl TwapCalculator {
                 twap_price: 0.0,
                 sample_count: 0,
                 coverage: 0.0,
-                in_settlement_window,
             });
         }
 
@@ -186,7 +185,6 @@ impl TwapCalculator {
             twap_price,
             sample_count: window_samples.len(),
             coverage,
-            in_settlement_window,
         })
     }
 

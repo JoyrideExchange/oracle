@@ -11,8 +11,8 @@ In addition to manipulation risk, options experience gamma explosion in the fina
 ## Features
 
 - **Real-time price streaming** from Pyth Hermes SSE API
-- **TWAP calculation** for settlement (30-minute window, 1-second samples)
-- **WebSocket server** broadcasts prices and settlement countdowns
+- **TWAP calculation** with rolling 30-minute window, 1-second samples
+- **WebSocket server** broadcasts prices and TWAP previews
 - **Multi-asset support**: BTC, ETH, SOL
 
 ## Quick Start
@@ -28,14 +28,29 @@ The service starts a WebSocket server on port 8083 and begins streaming prices f
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `ORACLE_BIND_ADDR` | `0.0.0.0:8083` | WebSocket server bind address |
-| `ROUND_DURATION_HOURS` | `24` | Round duration in hours (must match server) |
 | `RUST_LOG` | `info` | Log level (debug, info, warn, error) |
 
 ## Integration
 
-The Joyride server connects to the oracle WebSocket and uses the rolling 30-minute TWAP as the settlement price at round expiry. Clients discover the oracle URL from the server's `GET /api/v1/config` endpoint and connect directly for real-time display.
+The oracle is a pure price feed — it has no knowledge of rounds, settlement timing, or instruments. Settlement timing is owned by the settlement service; the gateway computes client-facing countdowns.
 
-Set `ORACLE_WS_URL` in the server's `.env` to point to this service (default `ws://127.0.0.1:8083`). Clients do not need a separate oracle URL.
+Downstream consumers connect via WebSocket:
+
+- **Order Gateway** — forwards spot prices to clients, caches TWAP for settlement
+- **Settlement Service** — reads TWAP coverage to decide when to settle
+- **Risk Engine** — uses spot prices for Greeks calculation
+- **Market Maker** — uses spot + TWAP for quoting
+- **Dashboard** — displays live prices and TWAP previews
+
+Internal configuration:
+
+- set `ORACLE_WS_URL` on downstream services to point here
+- local default: `ws://127.0.0.1:8083`
+
+Public clients should not connect to the oracle directly in production. They should use the unified API surface on `api.joyride.exchange` instead:
+
+- REST: `/v1/oracle/prices`, `/v1/oracle/twap-previews`, `/v1/oracle/settlement`
+- WebSocket: `wss://api.joyride.exchange/ws` with `spot.{asset}` and `settlement` subscriptions
 
 ## Library Usage
 
@@ -88,30 +103,15 @@ Connect to `ws://<host>:8083` to receive real-time events.
   "symbol": "SOL",
   "twap_price": 123.45,
   "sample_count": 1800,
-  "coverage": 1.0,
-  "in_settlement_window": false
-}
-```
-- `in_settlement_window` is true during the final 30 minutes before settlement (23:30-00:00 UTC)
-
-**`settlement`** - Countdown timers (updated every second)
-```json
-{
-  "type": "settlement",
-  "next_settlement": 1706227200,
-  "twap_window_start": 1706225400,
-  "seconds_to_twap_window": 3600,
-  "seconds_to_settlement": 5400,
-  "in_twap_window": false
+  "coverage": 1.0
 }
 ```
 
 **`connected`** / **`disconnected`** / **`error`** - Connection status events
 
-## Settlement Timing
+## TWAP Details
 
-- **Settlement**: Every `ROUND_DURATION_HOURS` hours, anchored to Jan 1, 2025 08:00 UTC (same epoch as the server)
-- **TWAP Window**: 30 minutes before each settlement (or full round for rounds shorter than 30 min)
+- **Window**: Rolling 30 minutes
 - **Sample Rate**: 1 sample per second
 - **Minimum Coverage**: 90% (1,620 of 1,800 samples required for a 30-min window)
 
@@ -129,13 +129,13 @@ Connect to `ws://<host>:8083` to receive real-time events.
                                  │  (30m window)   │
                                  └────────┬────────┘
                                           │
-                    ┌─────────────────────┼─────────────────────┐
-                    │                     │                     │
-                    ▼                     ▼                     ▼
-           ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-           │  Dashboard   │      │ Risk Engine  │      │   Clients    │
-           │  (WebSocket) │      │  (internal)  │      │  (WebSocket) │
-           └──────────────┘      └──────────────┘      └──────────────┘
+                    ┌──────────────┬───────┼───────┬──────────────┐
+                    │              │       │       │              │
+                    ▼              ▼       ▼       ▼              ▼
+             ┌──────────┐  ┌──────────┐  ┌───┐  ┌──────────┐  ┌──────────┐
+             │ Gateway  │  │Settlement│  │ RE│  │  Market  │  │Dashboard │
+             │          │  │ Service  │  │   │  │  Maker   │  │          │
+             └──────────┘  └──────────┘  └───┘  └──────────┘  └──────────┘
 ```
 
 **Components:**
@@ -143,7 +143,6 @@ Connect to `ws://<host>:8083` to receive real-time events.
 - **Pyth Client** (`pyth.rs`) - Connects to Pyth Hermes via SSE, parses price updates
 - **TWAP Calculator** (`twap.rs`) - Samples prices every second, maintains 30-minute rolling window
 - **WebSocket Server** (`server.rs`) - Broadcasts events to connected clients
-- **Settlement Timer** (`main.rs`) - Calculates countdown to next settlement window
 
 ## Pyth Feed IDs
 
