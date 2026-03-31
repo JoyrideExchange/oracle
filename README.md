@@ -46,11 +46,12 @@ Internal configuration:
 
 - set `ORACLE_WS_URL` on downstream services to point here
 - local default: `ws://127.0.0.1:8083`
+- optional: append `?client=<name>` for clearer server-side logs, for example `ws://127.0.0.1:8083?client=market-maker`
 
-Public clients should not connect to the oracle directly in production. They should use the unified API surface on `api.joyride.exchange` instead:
+Public clients should not connect to the oracle directly in production. They should use the unified API surface on `joyride.exchange/api` instead:
 
-- REST: `/v1/oracle/prices`, `/v1/oracle/twap-previews`, `/v1/oracle/settlement`
-- WebSocket: `wss://api.joyride.exchange/ws` with `spot.{asset}` and `settlement` subscriptions
+- REST: `https://joyride.exchange/api/v1/oracle/prices`, `https://joyride.exchange/api/v1/oracle/twap-previews`, `https://joyride.exchange/api/v1/oracle/settlement`
+- WebSocket: `wss://joyride.exchange/api/v1` with `spot.{asset}` and `settlement` subscriptions
 
 ## Library Usage
 
@@ -80,6 +81,8 @@ async fn main() {
 ## WebSocket API
 
 Connect to `ws://<host>:8083` to receive real-time events.
+
+New websocket clients receive the latest cached spot prices and TWAP previews immediately after connect, before live ticks resume.
 
 ### Event Types
 

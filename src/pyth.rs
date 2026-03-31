@@ -3,16 +3,26 @@
 //! Connects to Pyth's Hermes API via Server-Sent Events (SSE) to receive
 //! real-time price updates for configured assets.
 
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use eventsource_client::{Client, SSE};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::types::{Asset, OracleEvent, PriceUpdate};
 
 /// Default Hermes API endpoint.
 pub const HERMES_URL: &str = "https://hermes.pyth.network";
+const FRESHNESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const INITIAL_RECONNECT_BACKOFF_SECS: u64 = 5;
+const MAX_RECONNECT_BACKOFF_SECS: u64 = 60;
+const MAX_RECEIVE_LAG_MS: i64 = 10_000;
+const MAX_UNCHANGED_STREAK: u32 = 5;
 
 /// Pyth Hermes API response for price updates.
 #[derive(Debug, Deserialize)]
@@ -40,6 +50,60 @@ struct PriceData {
 #[derive(Debug, Deserialize)]
 struct StreamUpdate {
     parsed: Vec<ParsedPrice>,
+}
+
+#[derive(Debug, Default)]
+struct AssetFreshnessState {
+    prev_publish_time: Option<i64>,
+    unchanged_streak: u32,
+    last_log_instant: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FreshnessObservation {
+    publish_advanced: bool,
+    unchanged_streak: u32,
+    receive_lag_ms: i64,
+    publish_gap_secs: Option<i64>,
+}
+
+impl AssetFreshnessState {
+    fn observe(&mut self, publish_time: i64, receive_time: i64) -> FreshnessObservation {
+        let publish_gap_secs = self
+            .prev_publish_time
+            .map(|previous_publish_time| publish_time.saturating_sub(previous_publish_time));
+        let publish_advanced = self
+            .prev_publish_time
+            .map(|prev| prev != publish_time)
+            .unwrap_or(true);
+
+        if publish_advanced {
+            self.unchanged_streak = 0;
+        } else {
+            self.unchanged_streak = self.unchanged_streak.saturating_add(1);
+        }
+
+        self.prev_publish_time = Some(publish_time);
+
+        FreshnessObservation {
+            publish_advanced,
+            unchanged_streak: self.unchanged_streak,
+            receive_lag_ms: receive_time
+                .saturating_sub(publish_time)
+                .saturating_mul(1000),
+            publish_gap_secs,
+        }
+    }
+
+    fn should_emit_sample(&self, now: Instant) -> bool {
+        self.last_log_instant
+            .map(|last| now.duration_since(last) >= FRESHNESS_LOG_INTERVAL)
+            .unwrap_or(true)
+    }
+
+    fn mark_logged(&mut self, now: Instant) {
+        self.last_log_instant = Some(now);
+    }
 }
 
 /// Client for Pyth Hermes API.
@@ -71,12 +135,18 @@ impl PythClient {
     /// Run the client, streaming price updates indefinitely.
     /// Automatically reconnects on disconnect.
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        let mut backoff_secs = INITIAL_RECONNECT_BACKOFF_SECS;
+
         loop {
+            let reconnect_reason: String;
             match self.connect_and_stream().await {
                 Ok(()) => {
+                    reconnect_reason = "stream_closed".to_string();
                     info!("Pyth connection closed gracefully");
+                    backoff_secs = INITIAL_RECONNECT_BACKOFF_SECS;
                 }
                 Err(e) => {
+                    reconnect_reason = e.to_string();
                     error!("Pyth connection error: {}", e);
                     let _ = self
                         .event_tx
@@ -89,8 +159,13 @@ impl PythClient {
 
             let _ = self.event_tx.send(OracleEvent::Disconnected).await;
 
-            info!("Reconnecting to Pyth in 5 seconds...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            info!(
+                backoff_secs,
+                reconnect_reason = %reconnect_reason,
+                "Reconnecting to Pyth after backoff"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_backoff_secs(backoff_secs);
         }
     }
 
@@ -131,11 +206,30 @@ impl PythClient {
 
         let client = eventsource_client::ClientBuilder::for_url(&url)?.build();
         let mut stream = client.stream();
+        let mut freshness_state: HashMap<String, AssetFreshnessState> = HashMap::new();
 
         let _ = self.event_tx.send(OracleEvent::Connected).await;
         info!("Connected to Pyth Hermes");
 
-        while let Some(event) = stream.next().await {
+        loop {
+            let event = match tokio::time::timeout(SSE_IDLE_TIMEOUT, stream.next()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    info!("Pyth Hermes SSE stream ended");
+                    return Ok(());
+                }
+                Err(_) => {
+                    warn!(
+                        idle_timeout_secs = SSE_IDLE_TIMEOUT.as_secs(),
+                        "No SSE events received from Hermes; forcing reconnect"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Pyth Hermes SSE idle for {}s",
+                        SSE_IDLE_TIMEOUT.as_secs()
+                    ));
+                }
+            };
+
             match event {
                 Ok(SSE::Event(ev)) => {
                     if ev.event_type == "message" {
@@ -143,6 +237,43 @@ impl PythClient {
                             Ok(update) => {
                                 for parsed in update.parsed {
                                     if let Some(price_update) = self.parse_price_update(parsed) {
+                                        let receive_time = unix_now_secs();
+                                        let now = Instant::now();
+                                        let state = freshness_state
+                                            .entry(price_update.symbol.clone())
+                                            .or_default();
+                                        let observation =
+                                            state.observe(price_update.publish_time, receive_time);
+                                        let abnormal = observation.receive_lag_ms
+                                            > MAX_RECEIVE_LAG_MS
+                                            || observation.unchanged_streak >= MAX_UNCHANGED_STREAK;
+
+                                        if abnormal {
+                                            warn!(
+                                                asset = %price_update.symbol,
+                                                publish_time = price_update.publish_time,
+                                                publish_gap_secs = observation.publish_gap_secs,
+                                                receive_time,
+                                                receive_lag_ms = observation.receive_lag_ms,
+                                                publish_advanced = observation.publish_advanced,
+                                                unchanged_streak = observation.unchanged_streak,
+                                                "hermes_freshness_abnormal"
+                                            );
+                                            state.mark_logged(now);
+                                        } else if state.should_emit_sample(now) {
+                                            debug!(
+                                                asset = %price_update.symbol,
+                                                publish_time = price_update.publish_time,
+                                                publish_gap_secs = observation.publish_gap_secs,
+                                                receive_time,
+                                                receive_lag_ms = observation.receive_lag_ms,
+                                                publish_advanced = observation.publish_advanced,
+                                                unchanged_streak = observation.unchanged_streak,
+                                                "hermes_freshness"
+                                            );
+                                            state.mark_logged(now);
+                                        }
+
                                         debug!(
                                             "{}: ${:.4} (conf: ${:.4})",
                                             price_update.symbol,
@@ -171,8 +302,6 @@ impl PythClient {
                 }
             }
         }
-
-        Ok(())
     }
 
     fn parse_price_update(&self, parsed: ParsedPrice) -> Option<PriceUpdate> {
@@ -205,6 +334,17 @@ impl PythClient {
     }
 }
 
+fn next_backoff_secs(backoff_secs: u64) -> u64 {
+    (backoff_secs.saturating_mul(2)).min(MAX_RECONNECT_BACKOFF_SECS)
+}
+
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +362,41 @@ mod tests {
         assert_eq!(Asset::from_feed_id(Asset::Btc.feed_id()), Some(Asset::Btc));
         assert_eq!(Asset::from_feed_id(Asset::Eth.feed_id()), Some(Asset::Eth));
         assert_eq!(Asset::from_feed_id("unknown"), None);
+    }
+
+    #[test]
+    fn freshness_state_marks_publish_time_as_unchanged() {
+        let mut state = AssetFreshnessState::default();
+
+        let first = state.observe(100, 101);
+        let second = state.observe(100, 102);
+
+        assert!(first.publish_advanced);
+        assert_eq!(first.unchanged_streak, 0);
+        assert_eq!(first.publish_gap_secs, None);
+        assert!(!second.publish_advanced);
+        assert_eq!(second.unchanged_streak, 1);
+        assert_eq!(second.publish_gap_secs, Some(0));
+    }
+
+    #[test]
+    fn freshness_state_resets_streak_when_publish_time_advances() {
+        let mut state = AssetFreshnessState::default();
+
+        state.observe(100, 101);
+        state.observe(100, 102);
+        let third = state.observe(101, 103);
+
+        assert!(third.publish_advanced);
+        assert_eq!(third.unchanged_streak, 0);
+        assert_eq!(third.publish_gap_secs, Some(1));
+    }
+
+    #[test]
+    fn reconnect_backoff_caps_at_max() {
+        assert_eq!(next_backoff_secs(5), 10);
+        assert_eq!(next_backoff_secs(10), 20);
+        assert_eq!(next_backoff_secs(40), 60);
+        assert_eq!(next_backoff_secs(60), 60);
     }
 }

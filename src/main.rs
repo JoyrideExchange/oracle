@@ -13,10 +13,14 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{info, warn};
 
-use joyride_oracle::{run_server, Asset, OracleEvent, PythClient, TwapCalculator};
+use joyride_oracle::{
+    run_server, Asset, OracleEvent, PythClient, TwapCalculator, TwapPreview, HERMES_URL,
+};
 
 /// Assets tracked by the oracle.
 const ASSETS: &[Asset] = &[Asset::Sol, Asset::Btc, Asset::Eth];
+const ORDERED_FANOUT_BUFFER: usize = 4096;
+const PREVIEW_FANOUT_BUFFER: usize = 2048;
 
 /// WebSocket server address (0.0.0.0 for Docker/production).
 fn server_addr() -> String {
@@ -37,9 +41,12 @@ async fn main() -> anyhow::Result<()> {
             .join(", ")
     );
 
-    // Create broadcast channel for oracle events (to WebSocket clients)
-    let (broadcast_tx, _) = broadcast::channel::<OracleEvent>(256);
-    let broadcast_tx_clone = broadcast_tx.clone();
+    // Split ordered oracle traffic from latest-state preview traffic so
+    // preview fanout can never displace price delivery.
+    let (ordered_tx, _) = broadcast::channel::<OracleEvent>(ORDERED_FANOUT_BUFFER);
+    let ordered_tx_clone = ordered_tx.clone();
+    let (preview_tx, _) = broadcast::channel::<TwapPreview>(PREVIEW_FANOUT_BUFFER);
+    let preview_tx_clone = preview_tx.clone();
 
     // Create channel for Pyth client events
     let (event_tx, mut event_rx) = mpsc::channel::<OracleEvent>(256);
@@ -50,14 +57,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Start WebSocket server
     let addr = server_addr();
-    let server_rx = broadcast_tx.subscribe();
+    let ordered_server_rx = ordered_tx.subscribe();
+    let preview_server_rx = preview_tx.subscribe();
     let addr_clone = addr.clone();
     tokio::spawn(async move {
-        run_server(&addr_clone, server_rx).await;
+        run_server(&addr_clone, ordered_server_rx, preview_server_rx).await;
     });
     info!("WebSocket server listening on {}", addr);
 
     // Start Pyth client
+    info!(hermes_url = %HERMES_URL, "Using Hermes endpoint");
     let mut pyth_client = PythClient::new(event_tx, ASSETS.to_vec());
     tokio::spawn(async move {
         if let Err(e) = pyth_client.run().await {
@@ -66,7 +75,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start TWAP preview timer task (broadcasts rolling TWAP previews every second)
-    let timer_broadcast_tx = broadcast_tx.clone();
     let timer_twap = twap.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -80,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
             let twap = timer_twap.read().await;
             for asset in ASSETS {
                 if let Some(preview) = twap.calculate_preview(asset.symbol(), now) {
-                    let _ = timer_broadcast_tx.send(OracleEvent::TwapPreview(preview));
+                    let _ = preview_tx_clone.send(preview);
                 }
             }
         }
@@ -90,8 +98,11 @@ async fn main() -> anyhow::Result<()> {
     let mut last_prices: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
 
     while let Some(event) = event_rx.recv().await {
-        // Broadcast all events to WebSocket clients
-        let _ = broadcast_tx_clone.send(event.clone());
+        // Broadcast ordered events to WebSocket clients. Previews fan out through
+        // a dedicated latest-state channel from the timer task above.
+        if !matches!(event, OracleEvent::TwapPreview(_)) {
+            let _ = ordered_tx_clone.send(event.clone());
+        }
 
         match &event {
             OracleEvent::Connected => {
