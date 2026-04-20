@@ -40,9 +40,5 @@ pub mod types;
 
 pub use pyth::{PythClient, HERMES_URL};
 pub use server::run_server;
-<<<<<<< Updated upstream
-pub use twap::{TwapCalculator, TwapError, DEFAULT_TWAP_WINDOW_SECS, MIN_COVERAGE};
-=======
 pub use twap_calculator::{TwapCalculator, DEFAULT_TWAP_WINDOW_SECS};
->>>>>>> Stashed changes
 pub use types::{Asset, OracleEvent, PriceUpdate, TwapPreview, TwapResult, TwapSample};
