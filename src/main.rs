@@ -140,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
                 info!(
                     "TWAP for {}: ${:.4} ({} samples, {:.1}% coverage)",
                     result.symbol,
-                    result.twap_price,
+                    result.twap,
                     result.sample_count,
                     result.coverage * 100.0
                 );

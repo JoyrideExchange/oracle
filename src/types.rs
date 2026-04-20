@@ -87,7 +87,7 @@ pub struct TwapResult {
     pub symbol: String,
 
     /// The calculated TWAP price
-    pub twap_price: f64,
+    pub twap: f64,
 
     /// Start of the TWAP window (Unix timestamp in seconds)
     pub window_start: i64,
@@ -109,7 +109,7 @@ pub struct TwapPreview {
     pub symbol: String,
 
     /// Rolling 30-minute TWAP price
-    pub twap_price: f64,
+    pub twap: f64,
 
     /// Number of samples in the current window
     pub sample_count: usize,
