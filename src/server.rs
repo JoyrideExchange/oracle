@@ -8,7 +8,9 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use chrono::{SecondsFormat, Utc};
 use futures_util::{Sink, SinkExt, StreamExt};
+use serde::Serialize;
 use socket2::SockRef;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
@@ -21,8 +23,35 @@ use tracing::{error, info, warn};
 
 use crate::types::{OracleEvent, PriceUpdate, TwapPreview};
 
-const HEARTBEAT_JSON: &str = r#"{"type":"heartbeat"}"#;
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+#[derive(Serialize)]
+struct Envelope<'a, T: Serialize> {
+    timestamp: String,
+    #[serde(flatten)]
+    event: &'a T,
+}
+
+fn iso_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn serialize_json<T: Serialize>(event: &T) -> serde_json::Result<String> {
+    serde_json::to_string(&Envelope {
+        timestamp: iso_timestamp(),
+        event,
+    })
+}
+
+#[derive(Serialize)]
+struct Heartbeat {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+fn heartbeat_json() -> String {
+    serialize_json(&Heartbeat { kind: "heartbeat" })
+        .expect("heartbeat serialization is infallible")
+}
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const FANOUT_HEALTH_INTERVAL: Duration = Duration::from_secs(30);
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const ORDERED_CLIENT_BUFFER: usize = 4096;
@@ -413,7 +442,7 @@ async fn handle_client(
     let snapshot_prices = state.snapshot_prices().await;
     for price in &snapshot_prices {
         let event = OracleEvent::Price(price.clone());
-        let json = serde_json::to_string(&event)?;
+        let json = serialize_json(&event)?;
         if let Err(reason) = send_text(
             &mut ws_sender,
             json,
@@ -445,7 +474,7 @@ async fn handle_client(
         let snapshot_previews = state.snapshot_previews().await;
         for preview in &snapshot_previews {
             let event = OracleEvent::TwapPreview(preview.clone());
-            let json = serde_json::to_string(&event)?;
+            let json = serialize_json(&event)?;
             if let Err(reason) = send_text(
                 &mut ws_sender,
                 json,
@@ -488,7 +517,7 @@ async fn handle_client(
         loop {
             match ordered_rx.try_recv() {
                 Ok(event) => {
-                    let json = serde_json::to_string(&event)?;
+                    let json = serialize_json(&event)?;
                     if let Err(reason) = send_text(
                         &mut ws_sender,
                         json,
@@ -530,7 +559,7 @@ async fn handle_client(
             ordered = ordered_rx.recv() => {
                 match ordered {
                     Ok(event) => {
-                        let json = serde_json::to_string(&event)?;
+                        let json = serialize_json(&event)?;
                         if let Err(reason) = send_text(
                             &mut ws_sender,
                             json,
@@ -587,7 +616,7 @@ async fn handle_client(
                             &mut stats,
                         ) {
                             let event = OracleEvent::TwapPreview(preview);
-                            let json = serde_json::to_string(&event)?;
+                            let json = serialize_json(&event)?;
                             if let Err(reason) = send_text(
                                 &mut ws_sender,
                                 json,
@@ -627,7 +656,7 @@ async fn handle_client(
             _ = heartbeat.tick() => {
                 if let Err(reason) = send_text(
                     &mut ws_sender,
-                    HEARTBEAT_JSON.to_string(),
+                    heartbeat_json(),
                     &state,
                     connection_id,
                     peer_addr,
@@ -866,13 +895,17 @@ mod tests {
         });
 
         let (mut ws, _) = connect_async(format!("ws://{}", addr)).await.unwrap();
-        let msg = timeout(Duration::from_secs(7), ws.next())
+        let msg = timeout(Duration::from_secs(12), ws.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
 
-        assert_eq!(msg.into_text().unwrap(), HEARTBEAT_JSON);
+        let text = msg.into_text().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["type"], "heartbeat");
+        let timestamp = value["timestamp"].as_str().expect("timestamp field");
+        chrono::DateTime::parse_from_rfc3339(timestamp).expect("RFC 3339 timestamp");
 
         ws.send(Message::Close(None)).await.unwrap();
         server.await.unwrap();
