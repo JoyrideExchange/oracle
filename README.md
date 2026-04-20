@@ -39,14 +39,13 @@ Downstream consumers connect via WebSocket:
 - **Order Gateway** — forwards spot prices to clients, caches TWAP for settlement
 - **Settlement Service** — reads TWAP coverage to decide when to settle
 - **Risk Engine** — uses spot prices for Greeks calculation
-- **Market Maker** — uses spot + TWAP for quoting
 - **Dashboard** — displays live prices and TWAP previews
 
 Internal configuration:
 
 - set `ORACLE_WS_URL` on downstream services to point here
 - local default: `ws://127.0.0.1:8083`
-- optional: append `?client=<name>` for clearer server-side logs, for example `ws://127.0.0.1:8083?client=market-maker`
+- optional: append `?client=<name>` for clearer server-side logs, for example `ws://127.0.0.1:8083?client=risk-engine`
 
 Public clients should not connect to the oracle directly in production. They should use the unified API surface on `joyride.exchange/api` instead:
 
@@ -86,9 +85,12 @@ New websocket clients receive the latest cached spot prices and TWAP previews im
 
 ### Event Types
 
+Every broadcast message includes a top-level `timestamp` field: an RFC 3339 UTC timestamp (millisecond precision) recorded at the moment the server serialized the payload. Use it to measure end-to-end freshness — compare against `publish_time` on `price` events for Pyth-to-client latency.
+
 **`price`** - Real-time spot price from Pyth (multiple per second)
 ```json
 {
+  "timestamp": "2026-04-20T12:34:56.789Z",
   "type": "price",
   "symbol": "SOL",
   "price": 123.45,
@@ -102,6 +104,7 @@ New websocket clients receive the latest cached spot prices and TWAP previews im
 **`twap_preview`** - Rolling 30-minute TWAP (updated every second)
 ```json
 {
+  "timestamp": "2026-04-20T12:34:56.789Z",
   "type": "twap_preview",
   "symbol": "SOL",
   "twap_price": 123.45,
@@ -110,13 +113,21 @@ New websocket clients receive the latest cached spot prices and TWAP previews im
 }
 ```
 
-**`connected`** / **`disconnected`** / **`error`** - Connection status events
+**`heartbeat`** - Text frame sent every 10 seconds indicating a healthy connection
+```json
+{
+  "timestamp": "2026-04-20T12:34:56.789Z",
+  "type": "heartbeat"
+}
+```
+
+**`connected`** / **`disconnected`** / **`error`** - Status of the oracle's upstream connection to Pyth Hermes, not the consumer's connection to this server. Emitted on Pyth state transitions (edge-triggered, not replayed to new subscribers). The `error` payload carries a `message` field with the upstream error string. All three carry `timestamp`.
 
 ## TWAP Details
 
 - **Window**: Rolling 30 minutes
-- **Sample Rate**: 1 sample per second
-- **Minimum Coverage**: 90% (1,620 of 1,800 samples required for a 30-min window)
+- **Sample Rate**: 1 sample per second (1,800 samples fill the window)
+- **Coverage**: `actual_samples / 1800`, included in every `twap_preview` and `twap` payload. For example, a consumer could gate on `coverage >= 0.9` (1,620 samples) before using the TWAP.
 
 ## Architecture
 
@@ -132,13 +143,13 @@ New websocket clients receive the latest cached spot prices and TWAP previews im
                                  │  (30m window)   │
                                  └────────┬────────┘
                                           │
-                    ┌──────────────┬───────┼───────┬──────────────┐
-                    │              │       │       │              │
-                    ▼              ▼       ▼       ▼              ▼
-             ┌──────────┐  ┌──────────┐  ┌───┐  ┌──────────┐  ┌──────────┐
-             │ Gateway  │  │Settlement│  │ RE│  │  Market  │  │Dashboard │
-             │          │  │ Service  │  │   │  │  Maker   │  │          │
-             └──────────┘  └──────────┘  └───┘  └──────────┘  └──────────┘
+                    ┌──────────────┬───────┼──────────────┐
+                    │              │       │              │
+                    ▼              ▼       ▼              ▼
+             ┌──────────┐  ┌──────────┐  ┌───┐  ┌──────────┐
+             │ Gateway  │  │Settlement│  │ RE│  │Dashboard │
+             │          │  │ Service  │  │   │  │          │
+             └──────────┘  └──────────┘  └───┘  └──────────┘
 ```
 
 **Components:**
