@@ -136,15 +136,6 @@ async fn main() -> anyhow::Result<()> {
                     last_prices.insert(update.symbol.clone(), update.price);
                 }
             }
-            OracleEvent::Twap(result) => {
-                info!(
-                    "TWAP for {}: ${:.4} ({} samples, {:.1}% coverage)",
-                    result.symbol,
-                    result.twap,
-                    result.sample_count,
-                    result.coverage * 100.0
-                );
-            }
             OracleEvent::Error { message } => {
                 warn!("Oracle error: {}", message);
             }

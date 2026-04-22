@@ -1,6 +1,8 @@
-//! Joyride Oracle Service
+//! Joyride Oracle service and transport layer.
 //!
-//! This crate provides price data from Pyth Network for the Joyride exchange.
+//! The embeddable in-process API lives in `joyride-oracle-core`. This crate
+//! contains the WebSocket server and re-exports the core and wire crates for
+//! convenience.
 //!
 //! # Features
 //!
@@ -11,7 +13,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use joyride_oracle::{PythClient, TwapCalculator, Asset, OracleEvent};
+//! use joyride_oracle_core::{PythClient, TwapCalculator, Asset, OracleEvent};
 //! use tokio::sync::mpsc;
 //!
 //! #[tokio::main]
@@ -33,12 +35,10 @@
 //! }
 //! ```
 
-pub mod pyth;
 pub mod server;
-pub mod twap_calculator;
-pub mod types;
-
-pub use pyth::{PythClient, HERMES_URL};
+pub use joyride_oracle_core::{
+    Asset, OracleEvent, PythClient, TwapCalculator, TwapResult, TwapSample,
+    DEFAULT_TWAP_WINDOW_SECS, HERMES_URL,
+};
+pub use joyride_oracle_types::{BroadcastFrame, PriceUpdate, TwapPreview, WirePayload};
 pub use server::run_server;
-pub use twap_calculator::{TwapCalculator, DEFAULT_TWAP_WINDOW_SECS};
-pub use types::{Asset, OracleEvent, PriceUpdate, TwapPreview, TwapResult, TwapSample};

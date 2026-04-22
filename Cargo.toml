@@ -7,6 +7,10 @@
 # Phase 0: Pyth Hermes (HTTP/SSE streaming)
 # Phase 1+: Pyth Pro (lower latency)
 
+[workspace]
+members = [".", "crates/core", "crates/types"]
+resolver = "2"
+
 [package]
 name = "joyride-oracle"
 version = "0.1.0"
@@ -16,14 +20,14 @@ license = "MIT"
 repository = "https://github.com/joyride-exchange/oracle"
 
 [dependencies]
+joyride-oracle-core = { path = "crates/core", version = "0.1.0" }
+# Wire-format types (re-exported at the crate root for consumers).
+# `version` is required so the crate is publishable: when published, Cargo
+# drops the `path` and resolves the dep from the registry.
+joyride-oracle-types = { path = "crates/types", version = "0.1.0" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-
-# HTTP client for Pyth Hermes API
-reqwest = { version = "0.12", features = ["json"] }
-
-# SSE streaming
-eventsource-client = "0.13"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -46,5 +50,3 @@ futures-util = "0.3"
 tokio-tungstenite = "0.24"
 socket2 = "0.5"
 
-[dev-dependencies]
-tokio-test = "0.4"

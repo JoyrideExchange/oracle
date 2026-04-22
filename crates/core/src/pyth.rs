@@ -1,7 +1,4 @@
 //! Pyth Hermes client for streaming price updates.
-//!
-//! Connects to Pyth's Hermes API via Server-Sent Events (SSE) to receive
-//! real-time price updates for configured assets.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,7 +10,8 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
-use crate::types::{Asset, OracleEvent, PriceUpdate};
+use crate::types::{Asset, OracleEvent};
+use joyride_oracle_types::PriceUpdate;
 
 /// Default Hermes API endpoint.
 pub const HERMES_URL: &str = "https://hermes.pyth.network";
@@ -24,7 +22,6 @@ const MAX_RECONNECT_BACKOFF_SECS: u64 = 60;
 const MAX_RECEIVE_LAG_MS: i64 = 10_000;
 const MAX_UNCHANGED_STREAK: u32 = 5;
 
-/// Pyth Hermes API response for price updates.
 #[derive(Debug, Deserialize)]
 struct HermesPriceResponse {
     parsed: Vec<ParsedPrice>,
@@ -46,7 +43,6 @@ struct PriceData {
     publish_time: i64,
 }
 
-/// SSE event data from Hermes streaming endpoint.
 #[derive(Debug, Deserialize)]
 struct StreamUpdate {
     parsed: Vec<ParsedPrice>,
@@ -114,7 +110,6 @@ pub struct PythClient {
 }
 
 impl PythClient {
-    /// Create a new Pyth client.
     pub fn new(event_tx: mpsc::Sender<OracleEvent>, assets: Vec<Asset>) -> Self {
         Self {
             event_tx,
@@ -123,7 +118,6 @@ impl PythClient {
         }
     }
 
-    /// Create a new Pyth client with a custom Hermes URL.
     pub fn with_url(event_tx: mpsc::Sender<OracleEvent>, assets: Vec<Asset>, url: &str) -> Self {
         Self {
             event_tx,
@@ -132,8 +126,6 @@ impl PythClient {
         }
     }
 
-    /// Run the client, streaming price updates indefinitely.
-    /// Automatically reconnects on disconnect.
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut backoff_secs = INITIAL_RECONNECT_BACKOFF_SECS;
 
@@ -158,7 +150,6 @@ impl PythClient {
             }
 
             let _ = self.event_tx.send(OracleEvent::Disconnected).await;
-
             info!(
                 backoff_secs,
                 reconnect_reason = %reconnect_reason,
@@ -169,10 +160,9 @@ impl PythClient {
         }
     }
 
-    /// Fetch the latest price for all configured assets (one-shot).
     pub async fn fetch_latest(&self) -> anyhow::Result<Vec<PriceUpdate>> {
         let feed_ids: Vec<&str> = self.assets.iter().map(|a| a.feed_id()).collect();
-        let query: String = feed_ids
+        let query = feed_ids
             .iter()
             .map(|id| format!("ids[]={}", id))
             .collect::<Vec<_>>()
@@ -184,18 +174,16 @@ impl PythClient {
         let response = reqwest::get(&url).await?;
         let data: HermesPriceResponse = response.json().await?;
 
-        let updates: Vec<PriceUpdate> = data
+        Ok(data
             .parsed
             .into_iter()
             .filter_map(|p| self.parse_price_update(p))
-            .collect();
-
-        Ok(updates)
+            .collect())
     }
 
     async fn connect_and_stream(&mut self) -> anyhow::Result<()> {
         let feed_ids: Vec<&str> = self.assets.iter().map(|a| a.feed_id()).collect();
-        let query: String = feed_ids
+        let query = feed_ids
             .iter()
             .map(|id| format!("ids[]={}", id))
             .collect::<Vec<_>>()
@@ -231,118 +219,97 @@ impl PythClient {
             };
 
             match event {
-                Ok(SSE::Event(ev)) => {
-                    if ev.event_type == "message" {
-                        match serde_json::from_str::<StreamUpdate>(&ev.data) {
-                            Ok(update) => {
-                                for parsed in update.parsed {
-                                    if let Some(price_update) = self.parse_price_update(parsed) {
-                                        let receive_time = unix_now_secs();
-                                        let now = Instant::now();
-                                        let state = freshness_state
-                                            .entry(price_update.symbol.clone())
-                                            .or_default();
-                                        let observation =
-                                            state.observe(price_update.publish_time, receive_time);
-                                        let abnormal = observation.receive_lag_ms
-                                            > MAX_RECEIVE_LAG_MS
-                                            || observation.unchanged_streak >= MAX_UNCHANGED_STREAK;
+                Ok(SSE::Event(ev)) if ev.event_type == "message" => {
+                    match serde_json::from_str::<StreamUpdate>(&ev.data) {
+                        Ok(update) => {
+                            for parsed in update.parsed {
+                                if let Some(price_update) = self.parse_price_update(parsed) {
+                                    let receive_time = unix_now_secs();
+                                    let now = Instant::now();
+                                    let state = freshness_state
+                                        .entry(price_update.symbol.clone())
+                                        .or_default();
+                                    let observation =
+                                        state.observe(price_update.publish_time, receive_time);
+                                    let abnormal = observation.receive_lag_ms > MAX_RECEIVE_LAG_MS
+                                        || observation.unchanged_streak >= MAX_UNCHANGED_STREAK;
 
-                                        if abnormal {
-                                            warn!(
-                                                asset = %price_update.symbol,
-                                                publish_time = price_update.publish_time,
-                                                publish_gap_secs = observation.publish_gap_secs,
-                                                receive_time,
-                                                receive_lag_ms = observation.receive_lag_ms,
-                                                publish_advanced = observation.publish_advanced,
-                                                unchanged_streak = observation.unchanged_streak,
-                                                "hermes_freshness_abnormal"
-                                            );
-                                            state.mark_logged(now);
-                                        } else if state.should_emit_sample(now) {
-                                            debug!(
-                                                asset = %price_update.symbol,
-                                                publish_time = price_update.publish_time,
-                                                publish_gap_secs = observation.publish_gap_secs,
-                                                receive_time,
-                                                receive_lag_ms = observation.receive_lag_ms,
-                                                publish_advanced = observation.publish_advanced,
-                                                unchanged_streak = observation.unchanged_streak,
-                                                "hermes_freshness"
-                                            );
-                                            state.mark_logged(now);
-                                        }
-
-                                        debug!(
-                                            "{}: ${:.4} (conf: ${:.4})",
-                                            price_update.symbol,
-                                            price_update.price,
-                                            price_update.confidence
+                                    if abnormal {
+                                        warn!(
+                                            asset = %price_update.symbol,
+                                            publish_time = price_update.publish_time,
+                                            publish_gap_secs = observation.publish_gap_secs,
+                                            receive_time,
+                                            receive_lag_ms = observation.receive_lag_ms,
+                                            publish_advanced = observation.publish_advanced,
+                                            unchanged_streak = observation.unchanged_streak,
+                                            "hermes_freshness_abnormal"
                                         );
-                                        let _ = self
-                                            .event_tx
-                                            .send(OracleEvent::Price(price_update))
-                                            .await;
+                                    } else if state.should_emit_sample(now) {
+                                        info!(
+                                            asset = %price_update.symbol,
+                                            publish_time = price_update.publish_time,
+                                            publish_gap_secs = observation.publish_gap_secs,
+                                            receive_time,
+                                            receive_lag_ms = observation.receive_lag_ms,
+                                            publish_advanced = observation.publish_advanced,
+                                            unchanged_streak = observation.unchanged_streak,
+                                            "hermes_freshness_sample"
+                                        );
+                                        state.mark_logged(now);
+                                    }
+
+                                    if let Err(e) =
+                                        self.event_tx.send(OracleEvent::Price(price_update)).await
+                                    {
+                                        error!("Failed to send price update: {}", e);
                                     }
                                 }
                             }
-                            Err(e) => {
-                                warn!("Failed to parse SSE data: {} - {}", e, ev.data);
-                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse SSE update: {}", e);
                         }
                     }
                 }
-                Ok(SSE::Comment(_)) | Ok(SSE::Connected(_)) => {
-                    // Heartbeat or connection confirmation, ignore
+                Ok(SSE::Connected(_)) => {
+                    debug!("Hermes SSE connected");
                 }
+                Ok(SSE::Comment(_)) => {}
                 Err(e) => {
-                    error!("SSE stream error: {}", e);
                     return Err(anyhow::anyhow!("SSE stream error: {}", e));
                 }
+                _ => {}
             }
         }
     }
 
     fn parse_price_update(&self, parsed: ParsedPrice) -> Option<PriceUpdate> {
-        // Normalize the feed ID (ensure it has 0x prefix and is lowercase)
-        let feed_id = if parsed.id.starts_with("0x") {
-            parsed.id.to_lowercase()
-        } else {
-            format!("0x{}", parsed.id.to_lowercase())
-        };
-
-        let asset = Asset::from_feed_id(&feed_id)?;
-
-        // Convert price from string with exponent
-        let price_raw: i64 = parsed.price.price.parse().ok()?;
-        let conf_raw: i64 = parsed.price.conf.parse().ok()?;
+        let asset = Asset::from_feed_id(&parsed.id)?;
         let expo = parsed.price.expo;
-
-        // expo is negative (e.g., -8), so price = raw * 10^expo
-        let multiplier = 10f64.powi(expo);
-        let price = (price_raw as f64) * multiplier;
-        let confidence = (conf_raw as f64) * multiplier;
+        let raw_price: i64 = parsed.price.price.parse().ok()?;
+        let raw_conf: u64 = parsed.price.conf.parse().ok()?;
+        let factor = 10f64.powi(expo);
 
         Some(PriceUpdate {
             symbol: asset.symbol().to_string(),
-            price,
-            confidence,
+            price: raw_price as f64 * factor,
+            confidence: raw_conf as f64 * factor,
             publish_time: parsed.price.publish_time,
-            feed_id,
+            feed_id: parsed.id,
         })
     }
-}
-
-fn next_backoff_secs(backoff_secs: u64) -> u64 {
-    (backoff_secs.saturating_mul(2)).min(MAX_RECONNECT_BACKOFF_SECS)
 }
 
 fn unix_now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn next_backoff_secs(current: u64) -> u64 {
+    (current.saturating_mul(2)).min(MAX_RECONNECT_BACKOFF_SECS)
 }
 
 #[cfg(test)]
@@ -374,6 +341,7 @@ mod tests {
         assert!(first.publish_advanced);
         assert_eq!(first.unchanged_streak, 0);
         assert_eq!(first.publish_gap_secs, None);
+
         assert!(!second.publish_advanced);
         assert_eq!(second.unchanged_streak, 1);
         assert_eq!(second.publish_gap_secs, Some(0));
@@ -398,5 +366,32 @@ mod tests {
         assert_eq!(next_backoff_secs(10), 20);
         assert_eq!(next_backoff_secs(40), 60);
         assert_eq!(next_backoff_secs(60), 60);
+    }
+
+    #[test]
+    fn parse_update_scales_price() {
+        let (tx, _rx) = mpsc::channel(1);
+        let client = PythClient::new(tx, vec![Asset::Sol]);
+        let update = client
+            .parse_price_update(ParsedPrice {
+                id: Asset::Sol.feed_id().to_string(),
+                price: PriceData {
+                    price: "12345".to_string(),
+                    conf: "67".to_string(),
+                    expo: -2,
+                    publish_time: 42,
+                },
+                ema_price: PriceData {
+                    price: "0".to_string(),
+                    conf: "0".to_string(),
+                    expo: 0,
+                    publish_time: 42,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(update.symbol, "SOL");
+        assert!((update.price - 123.45).abs() < f64::EPSILON);
+        assert!((update.confidence - 0.67).abs() < f64::EPSILON);
     }
 }
