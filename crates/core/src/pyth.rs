@@ -285,7 +285,15 @@ impl PythClient {
     }
 
     fn parse_price_update(&self, parsed: ParsedPrice) -> Option<PriceUpdate> {
-        let asset = Asset::from_feed_id(&parsed.id)?;
+        // Hermes returns ids as bare lowercase hex; our Asset constants
+        // carry a 0x prefix. Normalize before matching.
+        let feed_id = if parsed.id.starts_with("0x") {
+            parsed.id.to_lowercase()
+        } else {
+            format!("0x{}", parsed.id.to_lowercase())
+        };
+
+        let asset = Asset::from_feed_id(&feed_id)?;
         let expo = parsed.price.expo;
         let raw_price: i64 = parsed.price.price.parse().ok()?;
         let raw_conf: u64 = parsed.price.conf.parse().ok()?;
@@ -296,7 +304,7 @@ impl PythClient {
             price: raw_price as f64 * factor,
             confidence: raw_conf as f64 * factor,
             publish_time: parsed.price.publish_time,
-            feed_id: parsed.id,
+            feed_id,
         })
     }
 }
@@ -329,6 +337,37 @@ mod tests {
         assert_eq!(Asset::from_feed_id(Asset::Btc.feed_id()), Some(Asset::Btc));
         assert_eq!(Asset::from_feed_id(Asset::Eth.feed_id()), Some(Asset::Eth));
         assert_eq!(Asset::from_feed_id("unknown"), None);
+    }
+
+    #[test]
+    fn parse_price_update_accepts_bare_hex_from_hermes() {
+        // Regression: the split dropped the feed-id normalization in
+        // parse_price_update, causing every Hermes price update to be
+        // silently dropped because Hermes returns bare-hex ids while
+        // Asset::feed_id constants carry the 0x prefix.
+        let (tx, _rx) = mpsc::channel(1);
+        let client = PythClient::new(tx, vec![Asset::Sol]);
+        let update = client
+            .parse_price_update(ParsedPrice {
+                id: "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"
+                    .to_string(),
+                price: PriceData {
+                    price: "12345".to_string(),
+                    conf: "67".to_string(),
+                    expo: -2,
+                    publish_time: 42,
+                },
+                ema_price: PriceData {
+                    price: "0".to_string(),
+                    conf: "0".to_string(),
+                    expo: 0,
+                    publish_time: 42,
+                },
+            })
+            .expect("bare-hex id from Hermes must resolve to an asset");
+
+        assert_eq!(update.symbol, "SOL");
+        assert!(update.feed_id.starts_with("0x"));
     }
 
     #[test]
