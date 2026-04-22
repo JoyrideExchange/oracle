@@ -946,7 +946,7 @@ mod tests {
         state
             .cache_preview(&TwapPreview {
                 symbol: "ETH".to_string(),
-                twap_price: 3_000.0,
+                twap: 3_000.0,
                 sample_count: 10,
                 coverage: 0.9,
             })
@@ -1003,7 +1003,7 @@ mod tests {
 
         let _ = preview_tx.send(TwapPreview {
             symbol: "BTC".to_string(),
-            twap_price: 100.0,
+            twap: 100.0,
             sample_count: 1,
             coverage: 1.0,
         });
@@ -1011,13 +1011,13 @@ mod tests {
 
         let _ = preview_tx.send(TwapPreview {
             symbol: "ETH".to_string(),
-            twap_price: 200.0,
+            twap: 200.0,
             sample_count: 2,
             coverage: 0.9,
         });
         let _ = preview_tx.send(TwapPreview {
             symbol: "BTC".to_string(),
-            twap_price: 101.0,
+            twap: 101.0,
             sample_count: 3,
             coverage: 1.0,
         });
@@ -1034,9 +1034,9 @@ mod tests {
 
         assert_eq!(previews.len(), 2);
         assert_eq!(previews[0].symbol, "BTC");
-        assert_eq!(previews[0].twap_price, 101.0);
+        assert_eq!(previews[0].twap, 101.0);
         assert_eq!(previews[1].symbol, "ETH");
-        assert_eq!(previews[1].twap_price, 200.0);
+        assert_eq!(previews[1].twap, 200.0);
     }
 
     #[test]
@@ -1060,7 +1060,7 @@ mod tests {
         state
             .cache_preview(&TwapPreview {
                 symbol: "BTC".to_string(),
-                twap_price: 100.0,
+                twap: 100.0,
                 sample_count: 1,
                 coverage: 1.0,
             })

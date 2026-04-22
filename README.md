@@ -104,7 +104,7 @@ New websocket clients receive the latest cached spot prices and TWAP previews im
 {
   "type": "twap_preview",
   "symbol": "SOL",
-  "twap_price": 123.45,
+  "twap": 123.45,
   "sample_count": 1800,
   "coverage": 1.0
 }

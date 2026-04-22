@@ -14,9 +14,6 @@ pub const DEFAULT_TWAP_WINDOW_SECS: i64 = 30 * 60;
 /// Default sampling interval in seconds (1 second).
 pub const DEFAULT_SAMPLE_INTERVAL_SECS: i64 = 1;
 
-/// Minimum coverage required for a valid TWAP (90%).
-pub const MIN_COVERAGE: f64 = 0.90;
-
 /// TWAP calculator that accumulates samples and computes averages.
 pub struct TwapCalculator {
     /// Samples per asset, keyed by symbol.
@@ -116,7 +113,7 @@ impl TwapCalculator {
 
         // Calculate simple average (all samples equally weighted since we sample at regular intervals)
         let sum: f64 = window_samples.iter().map(|s| s.price).sum();
-        let twap_price = sum / window_samples.len() as f64;
+        let twap = sum / window_samples.len() as f64;
 
         let expected = self.expected_samples();
         let coverage = window_samples.len() as f64 / expected as f64;
@@ -124,33 +121,19 @@ impl TwapCalculator {
         info!(
             "TWAP calculated for {}: ${:.4} ({} samples, {:.1}% coverage)",
             symbol,
-            twap_price,
+            twap,
             window_samples.len(),
             coverage * 100.0
         );
 
         Some(TwapResult {
             symbol: symbol.to_string(),
-            twap_price,
+            twap,
             window_start,
             window_end,
             sample_count: window_samples.len(),
             coverage,
         })
-    }
-
-    /// Calculate TWAP and validate that coverage meets minimum requirements.
-    pub fn calculate_validated(&self, symbol: &str, window_end: i64) -> Result<TwapResult, TwapError> {
-        let result = self.calculate(symbol, window_end).ok_or(TwapError::NoSamples)?;
-
-        if result.coverage < MIN_COVERAGE {
-            return Err(TwapError::InsufficientCoverage {
-                actual: result.coverage,
-                required: MIN_COVERAGE,
-            });
-        }
-
-        Ok(result)
     }
 
     /// Calculate a rolling TWAP preview (what settlement price would be if it happened now).
@@ -168,21 +151,21 @@ impl TwapCalculator {
         if window_samples.is_empty() {
             return Some(TwapPreview {
                 symbol: symbol.to_string(),
-                twap_price: 0.0,
+                twap: 0.0,
                 sample_count: 0,
                 coverage: 0.0,
             });
         }
 
         let sum: f64 = window_samples.iter().map(|s| s.price).sum();
-        let twap_price = sum / window_samples.len() as f64;
+        let twap = sum / window_samples.len() as f64;
 
         let expected = self.expected_samples();
         let coverage = (window_samples.len() as f64 / expected as f64).min(1.0);
 
         Some(TwapPreview {
             symbol: symbol.to_string(),
-            twap_price,
+            twap,
             sample_count: window_samples.len(),
             coverage,
         })
@@ -217,16 +200,6 @@ impl Default for TwapCalculator {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Errors that can occur during TWAP calculation.
-#[derive(Debug, thiserror::Error)]
-pub enum TwapError {
-    #[error("No samples available for TWAP calculation")]
-    NoSamples,
-
-    #[error("Insufficient coverage: {actual:.1}% < {required:.1}% required")]
-    InsufficientCoverage { actual: f64, required: f64 },
 }
 
 #[cfg(test)]
@@ -285,24 +258,9 @@ mod tests {
         let result = calc.calculate("SOL", 1009).unwrap();
 
         // Average of 200, 201, ..., 209 = 204.5
-        assert!((result.twap_price - 204.5).abs() < 0.01);
+        assert!((result.twap - 204.5).abs() < 0.01);
         assert_eq!(result.sample_count, 10);
         assert!((result.coverage - 1.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_validated_coverage() {
-        let mut calc = TwapCalculator::with_window(100); // 100 second window
-
-        // Only record 50 samples (50% coverage)
-        for i in 0..50 {
-            let update = make_update("SOL", 200.0, 1000 + i * 2); // Every 2 seconds
-            calc.record(&update);
-        }
-
-        // Should fail validation (50% < 90%)
-        let result = calc.calculate_validated("SOL", 1099);
-        assert!(matches!(result, Err(TwapError::InsufficientCoverage { .. })));
     }
 
     #[test]
