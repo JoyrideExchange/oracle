@@ -107,7 +107,7 @@ Every broadcast message includes a top-level `timestamp` field: an RFC 3339 UTC 
   "timestamp": "2026-04-20T12:34:56.789Z",
   "type": "twap_preview",
   "symbol": "SOL",
-  "twap_price": 123.45,
+  "twap": 123.45,
   "sample_count": 1800,
   "coverage": 1.0
 }
