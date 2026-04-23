@@ -5,7 +5,10 @@ edition = "2021"
 description = "Core in-process domain logic for the Joyride Oracle"
 license = "MIT"
 repository = "https://github.com/joyride-exchange/oracle"
+homepage = "https://joyride.exchange"
 readme = "../../README.md"
+keywords = ["oracle", "twap", "options", "pricing", "pyth"]
+categories = ["finance", "api-bindings"]
 
 [dependencies]
 joyride-oracle-types = { path = "../types", version = "0.1.0" }

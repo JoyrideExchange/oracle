@@ -18,6 +18,9 @@ edition = "2021"
 description = "Price oracle service using Pyth Network"
 license = "MIT"
 repository = "https://github.com/joyride-exchange/oracle"
+homepage = "https://joyride.exchange"
+keywords = ["oracle", "twap", "options", "websocket", "exchange"]
+categories = ["finance", "network-programming", "web-programming::websocket"]
 
 [dependencies]
 joyride-oracle-core = { path = "crates/core", version = "0.1.0" }
@@ -49,4 +52,3 @@ futures-util = "0.3"
 # WebSocket server
 tokio-tungstenite = "0.24"
 socket2 = "0.5"
-

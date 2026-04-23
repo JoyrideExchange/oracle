@@ -5,7 +5,10 @@ edition = "2021"
 description = "Wire-format types for the Joyride Oracle broadcast feed"
 license = "MIT"
 repository = "https://github.com/joyride-exchange/oracle"
+homepage = "https://joyride.exchange"
 readme = "../../README.md"
+keywords = ["oracle", "twap", "websocket", "serde", "options"]
+categories = ["api-bindings", "web-programming::websocket"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
