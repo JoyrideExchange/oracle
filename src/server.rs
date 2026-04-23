@@ -21,35 +21,48 @@ use tokio_tungstenite::{
 };
 use tracing::{error, info, warn};
 
-use crate::types::{OracleEvent, PriceUpdate, TwapPreview};
+use joyride_oracle_core::OracleEvent;
+use joyride_oracle_types::{PriceUpdate, TwapPreview};
 
+/// Server-side serialization envelope for domain events. Borrows the event
+/// so callers can keep it around (e.g. for metrics) after the JSON is produced.
+/// Produces JSON that parses as `joyride_oracle_types::BroadcastFrame` with a
+/// non-heartbeat `WirePayload`; the round-trip is pinned by
+/// `envelope_matches_broadcast_frame_wire_format`.
 #[derive(Serialize)]
-struct Envelope<'a, T: Serialize> {
+struct Envelope<'a> {
     timestamp: String,
     #[serde(flatten)]
-    event: &'a T,
+    event: &'a OracleEvent,
+}
+
+/// Heartbeats have no domain payload, so they serialize via a dedicated
+/// struct rather than through `Envelope`. `WirePayload::Heartbeat` in the
+/// wire crate is the owned deserialization counterpart.
+#[derive(Serialize)]
+struct HeartbeatFrame {
+    timestamp: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 fn iso_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn serialize_json<T: Serialize>(event: &T) -> serde_json::Result<String> {
+fn serialize_json(event: &OracleEvent) -> serde_json::Result<String> {
     serde_json::to_string(&Envelope {
         timestamp: iso_timestamp(),
         event,
     })
 }
 
-#[derive(Serialize)]
-struct Heartbeat {
-    #[serde(rename = "type")]
-    kind: &'static str,
-}
-
 fn heartbeat_json() -> String {
-    serialize_json(&Heartbeat { kind: "heartbeat" })
-        .expect("heartbeat serialization is infallible")
+    serde_json::to_string(&HeartbeatFrame {
+        timestamp: iso_timestamp(),
+        kind: "heartbeat",
+    })
+    .expect("heartbeat serialization is infallible")
 }
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const FANOUT_HEALTH_INTERVAL: Duration = Duration::from_secs(30);
@@ -875,9 +888,35 @@ fn parse_client_options(query: Option<&str>) -> ClientOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use joyride_oracle_types::{BroadcastFrame, WirePayload};
     use futures_util::{SinkExt, StreamExt};
     use tokio::time::timeout;
     use tokio_tungstenite::connect_async;
+
+    #[test]
+    fn envelope_matches_broadcast_frame_wire_format() {
+        // The server serializes via a private borrowed Envelope (and a separate
+        // HeartbeatFrame for keepalives); consumers deserialize via
+        // joyride-oracle-types::BroadcastFrame. Both paths must produce JSON
+        // that matches the wire contract.
+        let event = OracleEvent::Price(PriceUpdate {
+            symbol: "SOL".to_string(),
+            price: 123.45,
+            confidence: 0.12,
+            publish_time: 1_776_947_696,
+            feed_id: "0xef".to_string(),
+        });
+        let json = serialize_json(&event).unwrap();
+        let frame: BroadcastFrame = serde_json::from_str(&json).unwrap();
+        match frame.payload {
+            WirePayload::Price(p) => assert_eq!(p.symbol, "SOL"),
+            other => panic!("expected Price, got {other:?}"),
+        }
+
+        let hb = heartbeat_json();
+        let frame: BroadcastFrame = serde_json::from_str(&hb).unwrap();
+        assert!(matches!(frame.payload, WirePayload::Heartbeat));
+    }
 
     #[tokio::test]
     async fn handle_client_sends_heartbeat_when_idle() {
@@ -902,10 +941,8 @@ mod tests {
             .unwrap();
 
         let text = msg.into_text().unwrap();
-        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(value["type"], "heartbeat");
-        let timestamp = value["timestamp"].as_str().expect("timestamp field");
-        chrono::DateTime::parse_from_rfc3339(timestamp).expect("RFC 3339 timestamp");
+        let frame: BroadcastFrame = serde_json::from_str(&text).unwrap();
+        assert!(matches!(frame.payload, WirePayload::Heartbeat));
 
         ws.send(Message::Close(None)).await.unwrap();
         server.await.unwrap();

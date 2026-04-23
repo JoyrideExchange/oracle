@@ -3,34 +3,64 @@
 //! Accumulates price samples over a configurable window and computes
 //! the time-weighted average for settlement pricing.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
-use crate::types::{PriceUpdate, TwapPreview, TwapResult, TwapSample};
+use joyride_oracle_types::{PriceUpdate, TwapPreview};
+
+/// A single recorded TWAP sample.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwapSample {
+    /// The price at this sample time.
+    pub price: f64,
+    /// Unix timestamp in seconds.
+    pub timestamp: i64,
+}
+
+/// A completed TWAP calculation over a closed window.
+///
+/// Produced by [`TwapCalculator::calculate`] for callers that want to
+/// settle or persist a window value. Not on the oracle wire contract —
+/// the oracle service only broadcasts rolling previews — but available
+/// for embedders implementing their own settlement logic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwapResult {
+    /// The asset this TWAP is for.
+    pub symbol: String,
+
+    /// The calculated TWAP price.
+    pub twap: f64,
+
+    /// Start of the TWAP window (Unix timestamp in seconds).
+    pub window_start: i64,
+
+    /// End of the TWAP window (Unix timestamp in seconds).
+    pub window_end: i64,
+
+    /// Number of samples used in calculation.
+    pub sample_count: usize,
+
+    /// Percentage of expected samples that were collected (0.0 to 1.0).
+    pub coverage: f64,
+}
 
 /// Default TWAP window duration in seconds (30 minutes).
 pub const DEFAULT_TWAP_WINDOW_SECS: i64 = 30 * 60;
 
-/// Default sampling interval in seconds (1 second).
-pub const DEFAULT_SAMPLE_INTERVAL_SECS: i64 = 1;
+/// Sampling interval in seconds (1 second). Not configurable — `with_window`
+/// locks this in — and thus not part of the public API.
+const DEFAULT_SAMPLE_INTERVAL_SECS: i64 = 1;
 
 /// TWAP calculator that accumulates samples and computes averages.
 pub struct TwapCalculator {
-    /// Samples per asset, keyed by symbol.
     samples: HashMap<String, Vec<TwapSample>>,
-
-    /// TWAP window duration in seconds.
     window_secs: i64,
-
-    /// Expected sampling interval in seconds.
     sample_interval_secs: i64,
-
-    /// Last sampled timestamp per asset (to avoid duplicate samples).
     last_sample_time: HashMap<String, i64>,
 }
 
 impl TwapCalculator {
-    /// Create a new TWAP calculator with default settings.
     pub fn new() -> Self {
         Self {
             samples: HashMap::new(),
@@ -40,7 +70,6 @@ impl TwapCalculator {
         }
     }
 
-    /// Create a new TWAP calculator with custom window duration.
     pub fn with_window(window_secs: i64) -> Self {
         Self {
             samples: HashMap::new(),
@@ -50,30 +79,22 @@ impl TwapCalculator {
         }
     }
 
-    /// Record a price update as a TWAP sample.
-    /// Returns true if a new sample was recorded (based on sample interval).
     pub fn record(&mut self, update: &PriceUpdate) -> bool {
         let symbol = &update.symbol;
         let timestamp = update.publish_time;
 
-        // Check if we should sample (based on interval)
         if let Some(&last_time) = self.last_sample_time.get(symbol) {
             if timestamp - last_time < self.sample_interval_secs {
                 return false;
             }
         }
 
-        // Record the sample
         let sample = TwapSample {
             price: update.price,
             timestamp,
         };
 
-        self.samples
-            .entry(symbol.clone())
-            .or_insert_with(Vec::new)
-            .push(sample);
-
+        self.samples.entry(symbol.clone()).or_default().push(sample);
         self.last_sample_time.insert(symbol.clone(), timestamp);
 
         debug!(
@@ -84,23 +105,17 @@ impl TwapCalculator {
         true
     }
 
-    /// Get the current number of samples for an asset.
     pub fn sample_count(&self, symbol: &str) -> usize {
         self.samples.get(symbol).map(|s| s.len()).unwrap_or(0)
     }
 
-    /// Get the expected number of samples for the TWAP window.
     pub fn expected_samples(&self) -> usize {
         (self.window_secs / self.sample_interval_secs) as usize
     }
 
-    /// Calculate the TWAP for an asset over the specified window.
-    /// `window_end` is the Unix timestamp when the window ends (e.g., expiration time).
     pub fn calculate(&self, symbol: &str, window_end: i64) -> Option<TwapResult> {
         let samples = self.samples.get(symbol)?;
         let window_start = window_end - self.window_secs;
-
-        // Filter samples within the window
         let window_samples: Vec<&TwapSample> = samples
             .iter()
             .filter(|s| s.timestamp >= window_start && s.timestamp <= window_end)
@@ -111,10 +126,8 @@ impl TwapCalculator {
             return None;
         }
 
-        // Calculate simple average (all samples equally weighted since we sample at regular intervals)
         let sum: f64 = window_samples.iter().map(|s| s.price).sum();
         let twap = sum / window_samples.len() as f64;
-
         let expected = self.expected_samples();
         let coverage = window_samples.len() as f64 / expected as f64;
 
@@ -136,13 +149,9 @@ impl TwapCalculator {
         })
     }
 
-    /// Calculate a rolling TWAP preview (what settlement price would be if it happened now).
-    /// This uses the current time as the window end.
     pub fn calculate_preview(&self, symbol: &str, current_time: i64) -> Option<TwapPreview> {
         let samples = self.samples.get(symbol)?;
         let window_start = current_time - self.window_secs;
-
-        // Filter samples within the rolling window
         let window_samples: Vec<&TwapSample> = samples
             .iter()
             .filter(|s| s.timestamp >= window_start && s.timestamp <= current_time)
@@ -159,7 +168,6 @@ impl TwapCalculator {
 
         let sum: f64 = window_samples.iter().map(|s| s.price).sum();
         let twap = sum / window_samples.len() as f64;
-
         let expected = self.expected_samples();
         let coverage = (window_samples.len() as f64 / expected as f64).min(1.0);
 
@@ -171,16 +179,14 @@ impl TwapCalculator {
         })
     }
 
-    /// Clear all samples for an asset (call after settlement).
     pub fn clear(&mut self, symbol: &str) {
         self.samples.remove(symbol);
         self.last_sample_time.remove(symbol);
         info!("Cleared TWAP samples for {}", symbol);
     }
 
-    /// Clear all samples older than the given timestamp.
     pub fn prune(&mut self, before_timestamp: i64) {
-        for (symbol, samples) in self.samples.iter_mut() {
+        for (symbol, samples) in &mut self.samples {
             let original_len = samples.len();
             samples.retain(|s| s.timestamp >= before_timestamp);
             let pruned = original_len - samples.len();
@@ -190,7 +196,6 @@ impl TwapCalculator {
         }
     }
 
-    /// Get a snapshot of current samples for an asset (for debugging/verification).
     pub fn get_samples(&self, symbol: &str) -> Option<&Vec<TwapSample>> {
         self.samples.get(symbol)
     }
@@ -219,48 +224,29 @@ mod tests {
     #[test]
     fn test_record_samples() {
         let mut calc = TwapCalculator::new();
-
-        let update1 = make_update("SOL", 200.0, 1000);
-        let update2 = make_update("SOL", 201.0, 1001);
-        let update3 = make_update("SOL", 202.0, 1002);
-
-        assert!(calc.record(&update1));
-        assert!(calc.record(&update2));
-        assert!(calc.record(&update3));
-
+        assert!(calc.record(&make_update("SOL", 200.0, 1000)));
+        assert!(calc.record(&make_update("SOL", 201.0, 1001)));
+        assert!(calc.record(&make_update("SOL", 202.0, 1002)));
         assert_eq!(calc.sample_count("SOL"), 3);
     }
 
     #[test]
     fn test_sample_interval() {
         let mut calc = TwapCalculator::new();
-
-        // Same second should not record twice
-        let update1 = make_update("SOL", 200.0, 1000);
-        let update2 = make_update("SOL", 200.5, 1000); // Same timestamp
-
-        assert!(calc.record(&update1));
-        assert!(!calc.record(&update2)); // Should not record
-
+        assert!(calc.record(&make_update("SOL", 200.0, 1000)));
+        assert!(!calc.record(&make_update("SOL", 200.5, 1000)));
         assert_eq!(calc.sample_count("SOL"), 1);
     }
 
     #[test]
     fn test_calculate_twap() {
-        let mut calc = TwapCalculator::with_window(10); // 10 second window for testing
-
-        // Record 10 samples over 10 seconds
+        let mut calc = TwapCalculator::with_window(10);
         for i in 0..10 {
-            let update = make_update("SOL", 200.0 + i as f64, 1000 + i);
-            calc.record(&update);
+            calc.record(&make_update("SOL", 200.0 + i as f64, 1000 + i));
         }
-
         let result = calc.calculate("SOL", 1009).unwrap();
-
-        // Average of 200, 201, ..., 209 = 204.5
-        assert!((result.twap - 204.5).abs() < 0.01);
         assert_eq!(result.sample_count, 10);
-        assert!((result.coverage - 1.0).abs() < 0.01);
+        assert!((result.twap - 204.5).abs() < 0.0001);
     }
 
     #[test]
@@ -268,8 +254,7 @@ mod tests {
         let mut calc = TwapCalculator::new();
 
         for i in 0..100 {
-            let update = make_update("SOL", 200.0, 1000 + i);
-            calc.record(&update);
+            calc.record(&make_update("SOL", 200.0, 1000 + i));
         }
 
         assert_eq!(calc.sample_count("SOL"), 100);
