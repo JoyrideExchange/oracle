@@ -22,11 +22,11 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 
 use joyride_oracle_core::OracleEvent;
-use joyride_oracle_types::{PriceUpdate, TwapPreview};
+use joyride_oracle_wire::{PriceUpdate, TwapPreview};
 
 /// Server-side serialization envelope for domain events. Borrows the event
 /// so callers can keep it around (e.g. for metrics) after the JSON is produced.
-/// Produces JSON that parses as `joyride_oracle_types::BroadcastFrame` with a
+/// Produces JSON that parses as `joyride_oracle_wire::BroadcastFrame` with a
 /// non-heartbeat `WirePayload`; the round-trip is pinned by
 /// `envelope_matches_broadcast_frame_wire_format`.
 #[derive(Serialize)]
@@ -888,7 +888,7 @@ fn parse_client_options(query: Option<&str>) -> ClientOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use joyride_oracle_types::{BroadcastFrame, WirePayload};
+    use joyride_oracle_wire::{BroadcastFrame, WirePayload};
     use futures_util::{SinkExt, StreamExt};
     use tokio::time::timeout;
     use tokio_tungstenite::connect_async;

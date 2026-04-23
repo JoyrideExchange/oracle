@@ -1,7 +1,7 @@
 //! Oracle-local domain types.
 //!
 //! Wire-format types (`PriceUpdate`, `TwapPreview`, `TwapResult`, `WirePayload`,
-//! `BroadcastFrame`) live in the `joyride-oracle-types` crate and are re-exported
+//! `BroadcastFrame`) live in the `joyride-oracle-wire` crate and are re-exported
 //! at the `joyride_oracle_core` crate root. This module holds the in-process
 //! domain vocabulary: [`OracleEvent`] and [`Asset`].
 //!
@@ -20,10 +20,10 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OracleEvent {
     /// A new price update was received.
-    Price(joyride_oracle_types::PriceUpdate),
+    Price(joyride_oracle_wire::PriceUpdate),
 
     /// Rolling TWAP preview (every few seconds).
-    TwapPreview(joyride_oracle_types::TwapPreview),
+    TwapPreview(joyride_oracle_wire::TwapPreview),
 
     /// Upstream Pyth connection established.
     Connected,

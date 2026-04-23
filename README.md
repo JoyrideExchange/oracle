@@ -25,8 +25,8 @@ In addition to manipulation risk, options experience gamma explosion in the fina
 
 This repo is a Cargo workspace with three packages:
 
-- `joyride-oracle-core` — the in-process API for embedders: Pyth ingestion, TWAP calculation, `Asset`, and `OracleEvent`
-- `joyride-oracle-types` — the wire contract for the WebSocket feed: `BroadcastFrame` and `WirePayload`
+- `joyride-oracle-core` — the in-process logic and domain API for embedders: Pyth ingestion, TWAP calculation, `Asset`, and `OracleEvent`
+- `joyride-oracle-wire` — the serialized contract for external consumers of the WebSocket feed: `BroadcastFrame` and `WirePayload`
 - `joyride-oracle` — the service/transport crate: WebSocket server plus convenience re-exports of core and wire types
 
 The workspace supports embedded/in-process usage, service/WebSocket usage, and typed wire-format consumption.
@@ -102,10 +102,10 @@ Note: The service owns its own event ingestion; running it alongside an embedded
 
 ## Wire Usage
 
-`joyride-oracle-types` provides the typed JSON contract for frames emitted by the server. Depend on it directly (not on `joyride-oracle`) if you only need to parse the WebSocket feed — it pulls in `serde` and `chrono` and nothing else.
+`joyride-oracle-wire` provides the typed JSON contract for frames emitted by the server. Depend on it directly (not on `joyride-oracle`) if you only need to parse the WebSocket feed — it pulls in `serde` and `chrono` and nothing else.
 
 ```rust
-use joyride_oracle_types::{BroadcastFrame, WirePayload};
+use joyride_oracle_wire::{BroadcastFrame, WirePayload};
 use tokio_tungstenite::tungstenite::Message;
 
 while let Some(Ok(Message::Text(text))) = ws.next().await {
@@ -199,7 +199,7 @@ Pyth Hermes ─▶ PythClient ┤                            ├──▶ WS ser
 **Components:**
 
 - **`joyride-oracle-core`** (`crates/core/`) - Pyth client, TWAP calculator, in-process domain types
-- **`joyride-oracle-types`** (`crates/types/`) - typed wire contract for the WebSocket feed
+- **`joyride-oracle-wire`** (`crates/wire/`) - typed wire contract for the WebSocket feed
 - **`joyride-oracle`** (`src/server.rs`, `src/main.rs`) - WebSocket server and service binary
 
 ## Pyth Feed IDs

@@ -1,5 +1,5 @@
 [package]
-name = "joyride-oracle-types"
+name = "joyride-oracle-wire"
 version = "0.1.0"
 edition = "2021"
 description = "Wire-format types for the Joyride Oracle broadcast feed"

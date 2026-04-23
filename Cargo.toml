@@ -8,7 +8,7 @@
 # Phase 1+: Pyth Pro (lower latency)
 
 [workspace]
-members = [".", "crates/core", "crates/types"]
+members = [".", "crates/core", "crates/wire"]
 resolver = "2"
 
 [package]
@@ -19,15 +19,15 @@ description = "Price oracle service using Pyth Network"
 license = "MIT"
 repository = "https://github.com/joyride-exchange/oracle"
 homepage = "https://joyride.exchange"
-keywords = ["oracle", "twap", "options", "websocket", "exchange"]
-categories = ["finance", "network-programming", "web-programming::websocket"]
+# Deploy this crate from source (git checkout + cargo build). The
+# embeddable pieces (`joyride-oracle-core`) and the wire contract
+# (`joyride-oracle-wire`) are the published artifacts; the service
+# binary itself is not distributed via crates.io.
+publish = false
 
 [dependencies]
-joyride-oracle-core = { path = "crates/core", version = "0.1.0" }
-# Wire-format types (re-exported at the crate root for consumers).
-# `version` is required so the crate is publishable: when published, Cargo
-# drops the `path` and resolves the dep from the registry.
-joyride-oracle-types = { path = "crates/types", version = "0.1.0" }
+joyride-oracle-core = { path = "crates/core" }
+joyride-oracle-wire = { path = "crates/wire" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

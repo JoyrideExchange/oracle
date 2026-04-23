@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
-use joyride_oracle_types::{PriceUpdate, TwapPreview};
+use joyride_oracle_wire::{PriceUpdate, TwapPreview};
 
 /// A single recorded TWAP sample.
 #[derive(Debug, Clone, Serialize, Deserialize)]

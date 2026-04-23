@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::types::{Asset, OracleEvent};
-use joyride_oracle_types::PriceUpdate;
+use joyride_oracle_wire::PriceUpdate;
 
 /// Default Hermes API endpoint.
 pub const HERMES_URL: &str = "https://hermes.pyth.network";

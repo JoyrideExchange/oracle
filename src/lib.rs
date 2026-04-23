@@ -40,5 +40,5 @@ pub use joyride_oracle_core::{
     Asset, OracleEvent, PythClient, TwapCalculator, TwapResult, TwapSample,
     DEFAULT_TWAP_WINDOW_SECS, HERMES_URL,
 };
-pub use joyride_oracle_types::{BroadcastFrame, PriceUpdate, TwapPreview, WirePayload};
+pub use joyride_oracle_wire::{BroadcastFrame, PriceUpdate, TwapPreview, WirePayload};
 pub use server::run_server;

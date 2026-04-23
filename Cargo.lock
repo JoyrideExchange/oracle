@@ -780,7 +780,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "joyride-oracle-core",
- "joyride-oracle-types",
+ "joyride-oracle-wire",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -797,7 +797,7 @@ dependencies = [
  "anyhow",
  "eventsource-client",
  "futures-util",
- "joyride-oracle-types",
+ "joyride-oracle-wire",
  "reqwest",
  "serde",
  "serde_json",
@@ -806,7 +806,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "joyride-oracle-types"
+name = "joyride-oracle-wire"
 version = "0.1.0"
 dependencies = [
  "chrono",
