@@ -232,7 +232,9 @@ impl TwapCalculator {
         }
     }
 
-    pub fn get_samples(&self, symbol: &str) -> Option<Vec<TwapSample>> {
+    /// Owned snapshot of retained samples for `symbol`. Returns a `Vec` so
+    /// callers can iterate after releasing the outer lock on the calculator.
+    pub fn snapshot_samples(&self, symbol: &str) -> Option<Vec<TwapSample>> {
         self.samples
             .get(symbol)
             .map(|d| d.iter().cloned().collect())
