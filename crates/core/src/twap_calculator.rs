@@ -4,7 +4,7 @@
 //! the time-weighted average for settlement pricing.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tracing::{debug, info, warn};
 
 use joyride_oracle_wire::{PriceUpdate, TwapPreview};
@@ -48,32 +48,46 @@ pub struct TwapResult {
 /// Default TWAP window duration in seconds (30 minutes).
 pub const DEFAULT_TWAP_WINDOW_SECS: i64 = 30 * 60;
 
+/// Default retention horizon, in windows. Kept at two so `calculate()` can
+/// still be called with a `window_end` up to one window in the past.
+pub const DEFAULT_RETENTION_WINDOWS: u32 = 2;
+
 /// Sampling interval in seconds (1 second). Not configurable — `with_window`
 /// locks this in — and thus not part of the public API.
 const DEFAULT_SAMPLE_INTERVAL_SECS: i64 = 1;
 
 /// TWAP calculator that accumulates samples and computes averages.
 pub struct TwapCalculator {
-    samples: HashMap<String, Vec<TwapSample>>,
+    samples: HashMap<String, VecDeque<TwapSample>>,
     window_secs: i64,
+    /// How many windows of history to retain. Caps how far in the past
+    /// `calculate()` returns full coverage and bounds memory.
+    retention_windows: u32,
     sample_interval_secs: i64,
     last_sample_time: HashMap<String, i64>,
 }
 
 impl TwapCalculator {
     pub fn new() -> Self {
-        Self {
-            samples: HashMap::new(),
-            window_secs: DEFAULT_TWAP_WINDOW_SECS,
-            sample_interval_secs: DEFAULT_SAMPLE_INTERVAL_SECS,
-            last_sample_time: HashMap::new(),
-        }
+        Self::with_retention(DEFAULT_TWAP_WINDOW_SECS, DEFAULT_RETENTION_WINDOWS)
     }
 
     pub fn with_window(window_secs: i64) -> Self {
+        Self::with_retention(window_secs, DEFAULT_RETENTION_WINDOWS)
+    }
+
+    /// Construct with an explicit retention horizon. `retention_windows`
+    /// must be `>= 1`; a larger value lets `calculate()` look further into
+    /// the past at the cost of memory.
+    pub fn with_retention(window_secs: i64, retention_windows: u32) -> Self {
+        assert!(
+            retention_windows >= 1,
+            "retention_windows must be >= 1 (got {retention_windows})"
+        );
         Self {
             samples: HashMap::new(),
             window_secs,
+            retention_windows,
             sample_interval_secs: DEFAULT_SAMPLE_INTERVAL_SECS,
             last_sample_time: HashMap::new(),
         }
@@ -94,7 +108,23 @@ impl TwapCalculator {
             timestamp,
         };
 
-        self.samples.entry(symbol.clone()).or_default().push(sample);
+        let deque = self.samples.entry(symbol.clone()).or_default();
+        deque.push_back(sample);
+
+        // The interval check above keeps timestamps strictly increasing, so
+        // stale data always sits at the head and front-pop is enough.
+        let retention_secs = self
+            .window_secs
+            .saturating_mul(i64::from(self.retention_windows));
+        let cutoff = timestamp.saturating_sub(retention_secs);
+        while let Some(front) = deque.front() {
+            if front.timestamp < cutoff {
+                deque.pop_front();
+            } else {
+                break;
+            }
+        }
+
         self.last_sample_time.insert(symbol.clone(), timestamp);
 
         debug!(
@@ -188,7 +218,13 @@ impl TwapCalculator {
     pub fn prune(&mut self, before_timestamp: i64) {
         for (symbol, samples) in &mut self.samples {
             let original_len = samples.len();
-            samples.retain(|s| s.timestamp >= before_timestamp);
+            while let Some(front) = samples.front() {
+                if front.timestamp < before_timestamp {
+                    samples.pop_front();
+                } else {
+                    break;
+                }
+            }
             let pruned = original_len - samples.len();
             if pruned > 0 {
                 debug!("Pruned {} old samples for {}", pruned, symbol);
@@ -196,8 +232,12 @@ impl TwapCalculator {
         }
     }
 
-    pub fn get_samples(&self, symbol: &str) -> Option<&Vec<TwapSample>> {
-        self.samples.get(symbol)
+    /// Owned snapshot of retained samples for `symbol`. Returns a `Vec` so
+    /// callers can iterate after releasing the outer lock on the calculator.
+    pub fn snapshot_samples(&self, symbol: &str) -> Option<Vec<TwapSample>> {
+        self.samples
+            .get(symbol)
+            .map(|d| d.iter().cloned().collect())
     }
 }
 
@@ -262,5 +302,44 @@ mod tests {
         calc.prune(1050);
 
         assert_eq!(calc.sample_count("SOL"), 50);
+    }
+
+    #[test]
+    fn test_record_trims_to_retention_horizon() {
+        // Default retention is two windows wide, so a 10s window keeps 20s.
+        let mut calc = TwapCalculator::with_window(10);
+
+        for i in 0..100 {
+            calc.record(&make_update("SOL", 200.0 + i as f64, 1000 + i));
+        }
+
+        assert_eq!(calc.sample_count("SOL"), 21);
+
+        let result = calc.calculate("SOL", 1099).unwrap();
+        assert_eq!(result.sample_count, 11);
+
+        // window_end one window in the past still sits inside retention.
+        let past = calc.calculate("SOL", 1089).unwrap();
+        assert_eq!(past.sample_count, 11);
+    }
+
+    #[test]
+    fn test_with_retention_custom_horizon() {
+        let mut calc = TwapCalculator::with_retention(10, 5);
+
+        for i in 0..100 {
+            calc.record(&make_update("SOL", 200.0 + i as f64, 1000 + i));
+        }
+
+        assert_eq!(calc.sample_count("SOL"), 51);
+
+        let past = calc.calculate("SOL", 1059).unwrap();
+        assert_eq!(past.sample_count, 11);
+    }
+
+    #[test]
+    #[should_panic(expected = "retention_windows")]
+    fn test_with_retention_rejects_zero() {
+        let _ = TwapCalculator::with_retention(100, 0);
     }
 }
