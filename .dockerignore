@@ -1,0 +1,37 @@
+# Build artifacts
+target/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Environment and secrets — never ship these into an image
+.env
+.env.*
+*.pem
+*.key
+*.crt
+secrets/
+
+# Editor / OS metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and local-dev scratch
+*.log
+tmp/
+.cache/
+
+# Docs that don't need to be in the image
+README.md
+LICENSE
+docs/
+specs/
+
+# CI / dev tooling that has no runtime role
+.github/
+scripts/

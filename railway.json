@@ -1,0 +1,14 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "dockerfilePath": "Dockerfile",
+    "watchPatterns": [
+      "/Cargo.toml",
+      "/Cargo.lock",
+      "/src/**",
+      "/crates/**",
+      "/Dockerfile",
+      "/railway.json"
+    ]
+  }
+}
