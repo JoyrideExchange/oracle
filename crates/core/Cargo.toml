@@ -21,3 +21,9 @@ serde_json = "1"
 anyhow = "1"
 futures-util = "0.3"
 tracing = "0.1"
+
+[dev-dependencies]
+# Test-only tokio surface: macros for #[tokio::test], rt for the runtime,
+# net + io-util for the hand-rolled SSE server in stall-watchdog tests.
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "net", "io-util"] }
+httpmock = "0.7"
