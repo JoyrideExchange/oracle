@@ -15,8 +15,21 @@ use joyride_oracle_wire::PriceUpdate;
 
 /// Default Hermes API endpoint.
 pub const HERMES_URL: &str = "https://hermes.pyth.network";
+/// Explicit User-Agent so Hermes/Cloudflare logs identify us, and so we
+/// don't rely on whatever default the HTTP client sends (the eventsource
+/// crate sets only Accept + Cache-Control).
+const USER_AGENT: &str = "joyride-oracle/1.0 (+ops@joyride.exchange)";
 const FRESHNESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+/// Frame-level idle: reconnect if no SSE frame of any kind arrives within
+/// this window. Comments (heartbeats) and malformed events both reset it,
+/// so this alone does NOT protect against "connection stays open but no
+/// prices flow" — that's what `DEFAULT_PRICE_STALL_TIMEOUT` is for.
 const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Payload-level liveness: reconnect if no parseable `PriceUpdate`
+/// arrives within this window, even if heartbeats or garbage frames
+/// keep resetting the frame-level timer. Anchors "connected" to actual
+/// market-data flow instead of wire-level activity.
+const DEFAULT_PRICE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIAL_RECONNECT_BACKOFF_SECS: u64 = 5;
 const MAX_RECONNECT_BACKOFF_SECS: u64 = 60;
 const MAX_RECEIVE_LAG_MS: i64 = 10_000;
@@ -107,6 +120,7 @@ pub struct PythClient {
     event_tx: mpsc::Sender<OracleEvent>,
     assets: Vec<Asset>,
     hermes_url: String,
+    price_stall_timeout: Duration,
 }
 
 impl PythClient {
@@ -115,6 +129,7 @@ impl PythClient {
             event_tx,
             assets,
             hermes_url: HERMES_URL.to_string(),
+            price_stall_timeout: DEFAULT_PRICE_STALL_TIMEOUT,
         }
     }
 
@@ -123,7 +138,16 @@ impl PythClient {
             event_tx,
             assets,
             hermes_url: url.to_string(),
+            price_stall_timeout: DEFAULT_PRICE_STALL_TIMEOUT,
         }
+    }
+
+    /// Override the payload-level liveness deadline. Test-only seam; prod
+    /// should use `DEFAULT_PRICE_STALL_TIMEOUT`.
+    #[cfg(test)]
+    pub(crate) fn with_price_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.price_stall_timeout = timeout;
+        self
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -171,7 +195,19 @@ impl PythClient {
         let url = format!("{}/v2/updates/price/latest?{}", self.hermes_url, query);
         debug!("Fetching latest prices from: {}", url);
 
-        let response = reqwest::get(&url).await?;
+        // Same UA + explicit non-success handling as the SSE path, so both
+        // code paths get the same triage shape. `reqwest::get` uses a
+        // default, unconfigured client, which is what we want to avoid.
+        let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
+        let response = client.get(&url).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            error!(
+                status = %status,
+                "Pyth Hermes returned non-success status for /latest request"
+            );
+            anyhow::bail!("Pyth Hermes rejected /latest request: status={}", status);
+        }
         let data: HermesPriceResponse = response.json().await?;
 
         Ok(data
@@ -192,14 +228,41 @@ impl PythClient {
         let url = format!("{}/v2/updates/price/stream?{}", self.hermes_url, query);
         info!("Connecting to Pyth Hermes SSE stream: {}", url);
 
-        let client = eventsource_client::ClientBuilder::for_url(&url)?.build();
+        let client = eventsource_client::ClientBuilder::for_url(&url)?
+            .header("User-Agent", USER_AGENT)?
+            .build();
         let mut stream = client.stream();
         let mut freshness_state: HashMap<String, AssetFreshnessState> = HashMap::new();
-
-        let _ = self.event_tx.send(OracleEvent::Connected).await;
-        info!("Connected to Pyth Hermes");
+        // Two distinct states. The 2026-04-24 outage shape was precisely
+        // "HTTP OK, then zero payloads" — conflating the two would make
+        // "Connected" log lines lie about whether market data is flowing.
+        //   handshake_ok   => SSE::Connected fired (server returned 2xx)
+        //   streaming_live => first PriceUpdate parsed and emitted
+        // OracleEvent::Connected only fires on streaming_live.
+        let mut handshake_ok = false;
+        let mut streaming_live = false;
+        // Payload-level watchdog. Armed on SSE::Connected and reset on
+        // every emitted PriceUpdate. If heartbeats or malformed events
+        // keep the frame timer alive but no real prices ever parse out,
+        // this deadline fires and forces a reconnect.
+        let mut price_deadline: Option<Instant> = None;
 
         loop {
+            if let Some(deadline) = price_deadline {
+                if Instant::now() >= deadline {
+                    warn!(
+                        stall_timeout_secs = self.price_stall_timeout.as_secs(),
+                        handshake_ok,
+                        streaming_live,
+                        "No PriceUpdate received within stall timeout; forcing reconnect"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Pyth Hermes PriceUpdate stall for {}s",
+                        self.price_stall_timeout.as_secs()
+                    ));
+                }
+            }
+
             let event = match tokio::time::timeout(SSE_IDLE_TIMEOUT, stream.next()).await {
                 Ok(Some(event)) => event,
                 Ok(None) => {
@@ -209,6 +272,8 @@ impl PythClient {
                 Err(_) => {
                     warn!(
                         idle_timeout_secs = SSE_IDLE_TIMEOUT.as_secs(),
+                        handshake_ok,
+                        streaming_live,
                         "No SSE events received from Hermes; forcing reconnect"
                     );
                     return Err(anyhow::anyhow!(
@@ -219,11 +284,38 @@ impl PythClient {
             };
 
             match event {
+                Ok(SSE::Connected(_)) => {
+                    // HTTP 2xx received. Do NOT announce "Connected to Pyth
+                    // Hermes" here — in the failure mode we care about,
+                    // the server 200s and then sends nothing.
+                    if !handshake_ok {
+                        debug!("Pyth Hermes HTTP handshake accepted; awaiting first payload");
+                        handshake_ok = true;
+                        price_deadline = Some(Instant::now() + self.price_stall_timeout);
+                    }
+                }
                 Ok(SSE::Event(ev)) if ev.event_type == "message" => {
                     match serde_json::from_str::<StreamUpdate>(&ev.data) {
                         Ok(update) => {
                             for parsed in update.parsed {
                                 if let Some(price_update) = self.parse_price_update(parsed) {
+                                    if !streaming_live {
+                                        // First real payload of this connection.
+                                        // "Connected" now means market data is
+                                        // actually flowing, not just that the
+                                        // HTTP handshake succeeded.
+                                        info!("Connected to Pyth Hermes");
+                                        let _ =
+                                            self.event_tx.send(OracleEvent::Connected).await;
+                                        streaming_live = true;
+                                    }
+                                    // Reset the payload-level watchdog on
+                                    // every successful PriceUpdate, so
+                                    // heartbeats + garbage frames cannot
+                                    // hold the connection open forever.
+                                    price_deadline =
+                                        Some(Instant::now() + self.price_stall_timeout);
+
                                     let receive_time = unix_now_secs();
                                     let now = Instant::now();
                                     let state = freshness_state
@@ -272,10 +364,21 @@ impl PythClient {
                         }
                     }
                 }
-                Ok(SSE::Connected(_)) => {
-                    debug!("Hermes SSE connected");
-                }
                 Ok(SSE::Comment(_)) => {}
+                Err(eventsource_client::Error::UnexpectedResponse(resp, _)) => {
+                    // Explicit non-2xx from Hermes. Log status as a
+                    // structured field so 403/429/5xx is grep-able and
+                    // distinct from the idle-timeout path.
+                    let status = resp.status();
+                    error!(
+                        status = %status,
+                        "Pyth Hermes returned non-success status for SSE request"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Pyth Hermes rejected SSE request: status={}",
+                        status
+                    ));
+                }
                 Err(e) => {
                     return Err(anyhow::anyhow!("SSE stream error: {}", e));
                 }
@@ -432,5 +535,307 @@ mod tests {
         assert_eq!(update.symbol, "SOL");
         assert!((update.price - 123.45).abs() < f64::EPSILON);
         assert!((update.confidence - 0.67).abs() < f64::EPSILON);
+    }
+
+    /// Pin the User-Agent we send to Hermes. Originally added after a
+    /// 2026-04-24 incident where the oracle stalled for ~90 minutes and
+    /// identifying our traffic in upstream logs would have shortened
+    /// triage. An explicit UA also insulates us from any bot-detection
+    /// heuristic that keys on the absence of one.
+    #[tokio::test]
+    async fn connect_sends_joyride_user_agent_header() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let ua_mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/v2/updates/price/stream")
+                    .header_exists("user-agent")
+                    .matches(|req| {
+                        req.headers
+                            .as_ref()
+                            .and_then(|hs| {
+                                hs.iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+                                    .map(|(_, v)| v.contains("joyride-oracle"))
+                            })
+                            .unwrap_or(false)
+                    });
+                then.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body("");
+            })
+            .await;
+
+        let (tx, _rx) = mpsc::channel(16);
+        let mut client = PythClient::with_url(tx, vec![Asset::Btc], &server.base_url());
+
+        // run() loops on reconnect forever; cap it so the test can observe
+        // at least one request reaching the mock and then return.
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.run()).await;
+
+        ua_mock.assert_async().await;
+    }
+
+    fn sse_price_event_body(feed_id: &str) -> String {
+        // Minimal parseable SSE "message" event with one parsed price.
+        // expo=-8 → price field is raw × 10^-8. 10_000_000_000 ⇒ $100.
+        let payload = serde_json::json!({
+            "parsed": [{
+                "id": feed_id,
+                "price": {"price": "10000000000", "conf": "1000000", "expo": -8, "publish_time": 1000},
+                "ema_price": {"price": "10000000000", "conf": "1000000", "expo": -8, "publish_time": 1000}
+            }]
+        });
+        format!("event: message\ndata: {}\n\n", payload)
+    }
+
+    /// Failure-mode pin. The 2026-04-24 outage shape was "HTTP 200, then
+    /// zero SSE payloads for 30s." The oracle must NOT emit
+    /// OracleEvent::Connected in that case — that signal is now reserved
+    /// for "we actually received market data."
+    #[tokio::test]
+    async fn connected_event_does_not_fire_on_silent_200_from_hermes() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/v2/updates/price/stream");
+                then.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body("");
+            })
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut client = PythClient::with_url(tx, vec![Asset::Btc], &server.base_url());
+
+        let _ = tokio::time::timeout(Duration::from_millis(500), client.run()).await;
+
+        let mut saw_connected = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, OracleEvent::Connected) {
+                saw_connected = true;
+            }
+        }
+        assert!(
+            !saw_connected,
+            "OracleEvent::Connected must not fire on HTTP-OK + empty body \
+             (handshake without any payload)"
+        );
+    }
+
+    /// Happy-path pin. Once a real price event parses out of the stream,
+    /// OracleEvent::Connected should fire, and it should come at or
+    /// before the first Price event so downstream consumers can treat
+    /// "Connected" as a reliable precondition.
+    #[tokio::test]
+    async fn connected_event_fires_on_first_parseable_price_payload() {
+        use httpmock::prelude::*;
+
+        let feed_id = Asset::Btc.feed_id();
+        let body = sse_price_event_body(feed_id);
+
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/v2/updates/price/stream");
+                then.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(&body);
+            })
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut client = PythClient::with_url(tx, vec![Asset::Btc], &server.base_url());
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), client.run()).await;
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        let connected_idx = events
+            .iter()
+            .position(|e| matches!(e, OracleEvent::Connected));
+        let first_price_idx = events
+            .iter()
+            .position(|e| matches!(e, OracleEvent::Price(_)));
+
+        let connected_idx = connected_idx
+            .expect("OracleEvent::Connected must fire after the first parseable SSE payload");
+        let first_price_idx =
+            first_price_idx.expect("OracleEvent::Price must fire for the payload");
+        assert!(
+            connected_idx <= first_price_idx,
+            "Connected ({connected_idx}) must precede or coincide with first Price ({first_price_idx})"
+        );
+    }
+
+    /// Mirror of the SSE UA pin for the REST `/latest` path. Same crime,
+    /// same fix — keep both paths in sync.
+    #[tokio::test]
+    async fn fetch_latest_sends_joyride_user_agent_header() {
+        use httpmock::prelude::*;
+
+        let feed_id = Asset::Btc.feed_id();
+        let body = serde_json::json!({
+            "parsed": [{
+                "id": feed_id,
+                "price": {"price": "10000000000", "conf": "1000000", "expo": -8, "publish_time": 1000},
+                "ema_price": {"price": "10000000000", "conf": "1000000", "expo": -8, "publish_time": 1000}
+            }]
+        });
+
+        let server = MockServer::start_async().await;
+        let ua_mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/v2/updates/price/latest")
+                    .matches(|req| {
+                        req.headers
+                            .as_ref()
+                            .and_then(|hs| {
+                                hs.iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+                                    .map(|(_, v)| v.contains("joyride-oracle"))
+                            })
+                            .unwrap_or(false)
+                    });
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(body.to_string());
+            })
+            .await;
+
+        let (tx, _rx) = mpsc::channel(16);
+        let client = PythClient::with_url(tx, vec![Asset::Btc], &server.base_url());
+
+        let updates = client
+            .fetch_latest()
+            .await
+            .expect("fetch_latest should succeed against mock");
+        assert_eq!(updates.len(), 1);
+        ua_mock.assert_async().await;
+    }
+
+    /// On a non-2xx from `/latest`, surface an error whose message includes
+    /// the status code, so triage can grep for the exact status.
+    #[tokio::test]
+    async fn fetch_latest_errors_on_non_success_status() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/v2/updates/price/latest");
+                then.status(429).body("Too Many Requests");
+            })
+            .await;
+
+        let (tx, _rx) = mpsc::channel(16);
+        let client = PythClient::with_url(tx, vec![Asset::Btc], &server.base_url());
+
+        let err = client
+            .fetch_latest()
+            .await
+            .expect_err("fetch_latest must error on non-2xx");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("429"),
+            "error message must include the status code: {msg}"
+        );
+    }
+
+    /// Heartbeats-forever fake SSE server. httpmock can't hold a streaming
+    /// body open, so we do it by hand: accept one connection, write
+    /// HTTP/200 headers, drip SSE `: heartbeat` comments every 10 ms until
+    /// the client disconnects. Used by the payload-level stall test below
+    /// to simulate "connection stays open but no prices flow."
+    async fn spawn_heartbeat_only_sse_server() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let base_url = format!("http://{addr}");
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                tokio::spawn(async move {
+                    // Consume the request line + headers (until \r\n\r\n)
+                    // so the client side of the request is actually read.
+                    let mut buf = [0u8; 1024];
+                    use tokio::io::AsyncReadExt;
+                    let _ = socket.read(&mut buf).await;
+
+                    let headers = b"HTTP/1.1 200 OK\r\n\
+                                    content-type: text/event-stream\r\n\
+                                    cache-control: no-cache\r\n\
+                                    connection: keep-alive\r\n\
+                                    \r\n";
+                    if socket.write_all(headers).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        if socket.write_all(b": heartbeat\n\n").await.is_err() {
+                            return;
+                        }
+                        let _ = socket.flush().await;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                });
+            }
+        });
+        (base_url, handle)
+    }
+
+    /// Pins the gap the frame-level idle timer doesn't cover: heartbeats
+    /// reset SSE_IDLE_TIMEOUT, so without a payload-level deadline the
+    /// oracle could stay "connected" forever while the order book is
+    /// empty.
+    #[tokio::test]
+    async fn stall_watchdog_forces_reconnect_when_only_heartbeats_arrive() {
+        let (url, server_handle) = spawn_heartbeat_only_sse_server().await;
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut client = PythClient::with_url(tx, vec![Asset::Btc], &url)
+            .with_price_stall_timeout(Duration::from_millis(200));
+
+        // 1.5 s covers ~50 ms handshake + 200 ms stall deadline + room
+        // for the reconnect path to fire OracleEvent::Error before the
+        // outer timeout kicks in. The 5 s reconnect backoff is capped
+        // off by our timeout first.
+        let _ = tokio::time::timeout(Duration::from_millis(1500), client.run()).await;
+        server_handle.abort();
+
+        let mut saw_error_with_stall = false;
+        let mut saw_connected = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                OracleEvent::Error { message } if message.contains("PriceUpdate stall") => {
+                    saw_error_with_stall = true;
+                }
+                OracleEvent::Connected => {
+                    saw_connected = true;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_error_with_stall,
+            "payload-level stall watchdog must fire when heartbeats \
+             keep the frame-level timer reset but no PriceUpdate arrives"
+        );
+        assert!(
+            !saw_connected,
+            "OracleEvent::Connected must not fire when only heartbeats arrive"
+        );
     }
 }
