@@ -66,8 +66,22 @@ async fn main() -> anyhow::Result<()> {
     info!("WebSocket server listening on {}", addr);
 
     // Start Pyth client
-    info!(hermes_url = %HERMES_URL, "Using Hermes endpoint");
-    let mut pyth_client = PythClient::new(event_tx, ASSETS.to_vec());
+    let pyth_api_key = std::env::var("PYTH_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    if pyth_api_key.is_none() {
+        tracing::warn!(
+            "PYTH_API_KEY is not set. The public Hermes endpoint has required \
+             authentication since 2026-08-26T16:00Z and will answer 401 to \
+             every request; prices will freeze at their last cached values."
+        );
+    }
+    info!(
+        hermes_url = %HERMES_URL,
+        authenticated = pyth_api_key.is_some(),
+        "Using Hermes endpoint"
+    );
+    let mut pyth_client = PythClient::new(event_tx, ASSETS.to_vec()).with_api_key(pyth_api_key);
     tokio::spawn(async move {
         if let Err(e) = pyth_client.run().await {
             tracing::error!("Pyth client error: {}", e);

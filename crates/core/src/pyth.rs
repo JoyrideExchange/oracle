@@ -121,6 +121,7 @@ pub struct PythClient {
     assets: Vec<Asset>,
     hermes_url: String,
     price_stall_timeout: Duration,
+    api_key: Option<String>,
 }
 
 impl PythClient {
@@ -130,6 +131,7 @@ impl PythClient {
             assets,
             hermes_url: HERMES_URL.to_string(),
             price_stall_timeout: DEFAULT_PRICE_STALL_TIMEOUT,
+            api_key: None,
         }
     }
 
@@ -139,7 +141,13 @@ impl PythClient {
             assets,
             hermes_url: url.to_string(),
             price_stall_timeout: DEFAULT_PRICE_STALL_TIMEOUT,
+            api_key: None,
         }
+    }
+
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key.filter(|k| !k.trim().is_empty());
+        self
     }
 
     /// Override the payload-level liveness deadline. Test-only seam; prod
@@ -199,7 +207,11 @@ impl PythClient {
         // code paths get the same triage shape. `reqwest::get` uses a
         // default, unconfigured client, which is what we want to avoid.
         let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
-        let response = client.get(&url).send().await?;
+        let mut request = client.get(&url);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
             error!(
@@ -228,9 +240,12 @@ impl PythClient {
         let url = format!("{}/v2/updates/price/stream?{}", self.hermes_url, query);
         info!("Connecting to Pyth Hermes SSE stream: {}", url);
 
-        let client = eventsource_client::ClientBuilder::for_url(&url)?
-            .header("User-Agent", USER_AGENT)?
-            .build();
+        let mut builder =
+            eventsource_client::ClientBuilder::for_url(&url)?.header("User-Agent", USER_AGENT)?;
+        if let Some(key) = &self.api_key {
+            builder = builder.header("Authorization", &format!("Bearer {key}"))?;
+        }
+        let client = builder.build();
         let mut stream = client.stream();
         let mut freshness_state: HashMap<String, AssetFreshnessState> = HashMap::new();
         // Two distinct states. The 2026-04-24 outage shape was precisely

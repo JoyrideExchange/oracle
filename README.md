@@ -40,6 +40,7 @@ To run the standalone WebSocket service locally, see [Service Usage](#service-us
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `ORACLE_BIND_ADDR` | `0.0.0.0:8083` | WebSocket server bind address |
+| `PYTH_API_KEY` | _(none)_ | Bearer token for Pyth Hermes. Required against the public endpoint, which has rejected anonymous requests with `401` since 2026-08-26T16:00Z. Unset, the oracle warns at startup, serves its last cached prices, and reconnect-loops on a 60s backoff. |
 
 ## Integration
 
