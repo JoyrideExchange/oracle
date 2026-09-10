@@ -1,7 +1,7 @@
 //! Wire-format types for the Joyride Oracle broadcast feed.
 //!
 //! This crate is *wire only*. It describes the exact JSON the oracle
-//! broadcasts over WebSocket and nothing else — no Pyth ingestion, no
+//! broadcasts over WebSocket and nothing else — no upstream ingestion, no
 //! TWAP calculator, no in-process event type. Consumers parsing the
 //! feed in Rust should deserialize into [`BroadcastFrame`]; every frame
 //! the oracle emits matches that shape.
@@ -17,7 +17,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// A price update from Pyth.
+/// A spot price update from the oracle's upstream price feed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriceUpdate {
     /// The asset symbol (e.g., "SOL", "BTC", "ETH")
@@ -26,13 +26,16 @@ pub struct PriceUpdate {
     /// Price in USD (as f64 for simplicity; production may use fixed-point)
     pub price: f64,
 
-    /// Confidence interval (+/- this amount)
+    /// Confidence (+/- this amount, in USD). From Block Scholes this is half
+    /// the index bid/ask spread; it was the Pyth confidence interval before
+    /// 2026-09. The two are not comparable.
     pub confidence: f64,
 
-    /// Unix timestamp in seconds when this price was published
+    /// Unix timestamp in seconds when the upstream published this price
     pub publish_time: i64,
 
-    /// The Pyth feed ID (hex string)
+    /// Upstream feed identifier: `blockscholes:index.px:<SYMBOL>` from
+    /// Block Scholes, or the 0x-prefixed Pyth feed ID from the Pyth client.
     pub feed_id: String,
 }
 
@@ -68,10 +71,10 @@ pub enum WirePayload {
     /// Rolling TWAP preview (every few seconds).
     TwapPreview(TwapPreview),
 
-    /// Upstream Pyth connection established.
+    /// Upstream price feed live (first price received on a new connection).
     Connected,
 
-    /// Upstream Pyth connection lost.
+    /// Upstream price-feed connection lost.
     Disconnected,
 
     /// An error occurred on the upstream connection.
@@ -88,7 +91,7 @@ pub enum WirePayload {
 pub struct BroadcastFrame {
     /// Envelope timestamp, stamped by the oracle at serialization time.
     /// Use this to measure end-to-end freshness or detect clock skew;
-    /// compare against `PriceUpdate::publish_time` for Pyth-to-client latency.
+    /// compare against `PriceUpdate::publish_time` for upstream-to-client latency.
     pub timestamp: DateTime<Utc>,
 
     /// The payload carried by this frame.

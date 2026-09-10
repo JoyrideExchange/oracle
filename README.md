@@ -1,8 +1,10 @@
 # Joyride Oracle
 
-The Joyride oracle workspace consumes real-time spot prices from [Pyth Network](https://pyth.network), calculates TWAP (Time-Weighted Average Price), and optionally broadcasts the resulting feed over WebSocket.
+The Joyride oracle workspace consumes a real-time spot index from [Block Scholes](https://www.blockscholes.com), calculates TWAP (Time-Weighted Average Price), and optionally broadcasts the resulting feed over WebSocket.
 
 This repo is the reference implementation of the TWAP used for Joyride options settlement. It is public so that anyone can verify the math, inspect the feed mapping, and replicate the calculation.
+
+**Price source.** Settlement TWAPs are computed from the Block Scholes `index.px` spot index (BTC/USD, ETH/USD, SOL/USD), a composite of exchange prices. The TWAP math applied to that index is entirely in this repo. Block Scholes does not publish the list of exchanges in the index or their weights, and replicating a settlement from raw inputs requires Block Scholes data access. Before 2026-09, the oracle used Pyth Network; the Pyth client is still in `joyride-oracle-core` (see [Pyth Client](#pyth-client)) but is not wired into the service.
 
 > **The oracle is not a public websocket endpoint.** Public clients, including market makers, trading frontends, and third-party integrations, should use the unified surface at `wss://joyride.exchange/api/v1` and the REST endpoints under `https://joyride.exchange/api/v1/oracle/*` instead.
 
@@ -14,7 +16,7 @@ In addition to manipulation risk, options experience gamma explosion in the fina
 
 ## Features
 
-- **Real-time price streaming** from Pyth Hermes SSE API
+- **Real-time spot index streaming** from the Block Scholes WebSocket API (1 update/second per asset)
 - **TWAP calculation** with rolling 30-minute window, 1-second samples
 - **Embeddable core crate** for in-process TWAP consumption
 - **WebSocket server** for broadcast/distributed deployments
@@ -25,7 +27,7 @@ In addition to manipulation risk, options experience gamma explosion in the fina
 
 This repo is a Cargo workspace with three packages:
 
-- `joyride-oracle-core` — the in-process logic and domain API for embedders: Pyth ingestion, TWAP calculation, `Asset`, and `OracleEvent`
+- `joyride-oracle-core` — the in-process logic and domain API for embedders: Block Scholes ingestion (plus the retained Pyth client), TWAP calculation, `Asset`, and `OracleEvent`
 - `joyride-oracle-wire` — the serialized contract for external consumers of the WebSocket feed: `BroadcastFrame` and `WirePayload`
 - `joyride-oracle` — the service/transport crate: WebSocket server plus convenience re-exports of core and wire types
 
@@ -40,7 +42,8 @@ To run the standalone WebSocket service locally, see [Service Usage](#service-us
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `ORACLE_BIND_ADDR` | `0.0.0.0:8083` | WebSocket server bind address |
-| `PYTH_API_KEY` | _(none)_ | Bearer token for Pyth Hermes. Required against the public endpoint, which has rejected anonymous requests with `401` since 2026-08-26T16:00Z. Unset, the oracle warns at startup, serves its last cached prices, and reconnect-loops on a 60s backoff. |
+| `BLOCKSCHOLES_API_KEY` | _(none)_ | Block Scholes API key, sent in the JSON-RPC `authenticate` call after connect. Required. Unset or rejected, the oracle warns, serves its last cached prices, and reconnect-loops with backoff up to 60s. The key's subscribe rate limit is shared by every connection using it. |
+| `BLOCKSCHOLES_FREQUENCY_MS` | `1000` | Subscription `frequency` for `index.px`. Must be a value the account's plan allows (currently `1000`, `20000`, or `60000`); any other value is rejected at subscribe time and the oracle reconnect-loops with the rejection logged. |
 
 ## Integration
 
@@ -54,10 +57,10 @@ Internal configuration:
 
 ## Embedded Usage
 
-`joyride-oracle-core` provides Pyth ingestion and TWAP logic for in-process usage:
+`joyride-oracle-core` provides Block Scholes ingestion and TWAP logic for in-process usage:
 
 ```rust
-use joyride_oracle_core::{PythClient, TwapCalculator, Asset, OracleEvent};
+use joyride_oracle_core::{BlockScholesClient, TwapCalculator, Asset, OracleEvent};
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -65,12 +68,13 @@ async fn main() {
     let (tx, mut rx) = mpsc::channel(256);
     let assets = vec![Asset::Sol, Asset::Btc, Asset::Eth];
 
-    let mut client = PythClient::new(tx, assets);
+    let mut client = BlockScholesClient::new(tx, assets)
+        .with_api_key(std::env::var("BLOCKSCHOLES_API_KEY").ok());
     let mut twap = TwapCalculator::new();
 
     tokio::spawn(async move {
         if let Err(e) = client.run().await {
-            eprintln!("pyth client error: {e}");
+            eprintln!("block scholes client error: {e}");
         }
     });
 
@@ -87,19 +91,19 @@ You can also inspect raw samples via `TwapCalculator::get_samples()` if you want
 
 ## Service Usage
 
-`joyride-oracle` is the binary form of this repo: it wires `PythClient` → `TwapCalculator` → a WebSocket fanout server and runs as a standalone process so multiple consumers can share one Pyth connection.
+`joyride-oracle` is the binary form of this repo: it wires `BlockScholesClient` → `TwapCalculator` → a WebSocket fanout server and runs as a standalone process so multiple consumers can share one upstream connection.
 
 ```bash
 cargo run -p joyride-oracle
 ```
 
-Binds `0.0.0.0:8083` by default (override with `ORACLE_BIND_ADDR`) and starts broadcasting price and TWAP data as soon as the first Pyth update arrives.
+Binds `0.0.0.0:8083` by default (override with `ORACLE_BIND_ADDR`) and starts broadcasting price and TWAP data as soon as the first Block Scholes update arrives.
 
 Connect to `ws://<host>:8083` to receive real-time events from the `joyride-oracle` service.
 
 New websocket clients receive the latest cached spot prices and TWAP previews immediately after connect, before live ticks resume.
 
-Note: The service owns its own event ingestion; running it alongside an embedded `joyride-oracle-core` in another process means two independent Hermes connections.
+Note: The service owns its own event ingestion; running it alongside an embedded `joyride-oracle-core` in another process means two independent Block Scholes connections on the same API key.
 
 ## Wire Usage
 
@@ -120,25 +124,26 @@ while let Some(Ok(Message::Text(text))) = ws.next().await {
 }
 ```
 
-`frame.timestamp` is an RFC 3339 `DateTime<Utc>`, parsed automatically on deserialization. Compare against `PriceUpdate::publish_time` (Pyth's own timestamp, in seconds) to measure end-to-end latency.
+`frame.timestamp` is an RFC 3339 `DateTime<Utc>`, parsed automatically on deserialization. Compare against `PriceUpdate::publish_time` (the upstream's own timestamp, in seconds) to measure end-to-end latency.
 
 ### Event Types
 
-Every broadcast message includes a top-level `timestamp` field: an RFC 3339 UTC timestamp (millisecond precision) recorded at the moment the server serialized the payload. Use it to measure end-to-end freshness — compare against `publish_time` on `price` events for Pyth-to-client latency.
+Every broadcast message includes a top-level `timestamp` field: an RFC 3339 UTC timestamp (millisecond precision) recorded at the moment the server serialized the payload. Use it to measure end-to-end freshness — compare against `publish_time` on `price` events for upstream-to-client latency.
 
-**`price`** - Real-time spot price from Pyth (multiple per second)
+**`price`** - Real-time spot index price from Block Scholes (one per asset per second)
 ```json
 {
   "timestamp": "2026-04-20T12:34:56.789Z",
   "type": "price",
   "symbol": "SOL",
   "price": 123.45,
-  "confidence": 0.12,
+  "confidence": 0.005,
   "publish_time": 1706198400,
-  "feed_id": "0xef0d8b6fda..."
+  "feed_id": "blockscholes:index.px:SOL"
 }
 ```
-- `confidence` is from Pyth's publisher network - lower values mean more agreement between data sources.
+- `confidence` is half the Block Scholes index bid/ask spread, in USD. It is typically cents and is **not** comparable to the Pyth confidence interval the feed carried before 2026-09, which measured disagreement between Pyth publishers and ran orders of magnitude wider.
+- `feed_id` is `blockscholes:index.px:<SYMBOL>`. It was the Pyth hex feed ID before 2026-09.
 
 **`twap_preview`** - Rolling 30-minute TWAP (updated every second)
 ```json
@@ -160,7 +165,7 @@ Every broadcast message includes a top-level `timestamp` field: an RFC 3339 UTC 
 }
 ```
 
-**`connected`** / **`disconnected`** / **`error`** - Status of the oracle's upstream connection to Pyth Hermes, not the consumer's connection to this server. Emitted on Pyth state transitions (edge-triggered, not replayed to new subscribers). The `error` payload carries a `message` field with the upstream error string. All three carry `timestamp`.
+**`connected`** / **`disconnected`** / **`error`** - Status of the oracle's upstream connection to Block Scholes, not the consumer's connection to this server. `connected` fires when the first price arrives on a new upstream connection, not on the transport handshake. Emitted on upstream state transitions (edge-triggered, not replayed to new subscribers). The `error` payload carries a `message` field with the upstream error string. All three carry `timestamp`.
 
 ## TWAP Details
 
@@ -170,16 +175,16 @@ Every broadcast message includes a top-level `timestamp` field: an RFC 3339 UTC 
 
 ## Architecture
 
-Two deployment shapes, both built from the same core components. You can pick one or run both — nothing prevents an embedded process and the service binary from coexisting. Just note that each process maintains its own Pyth connection and its own TWAP state; there's no shared memory between them.
+Two deployment shapes, both built from the same core components. You can pick one or run both — nothing prevents an embedded process and the service binary from coexisting. Just note that each process maintains its own upstream connection and its own TWAP state; there's no shared memory between them.
 
-**Embedded:** your process owns a `PythClient` and a `TwapCalculator`. The client delivers `OracleEvent`s over an mpsc channel; your code reads them, feeds `Price` events into the calculator, and queries the calculator when it needs a TWAP. The calculator is a side-store you drive — not a pipeline stage events pass through.
+**Embedded:** your process owns a `BlockScholesClient` and a `TwapCalculator`. The client delivers `OracleEvent`s over an mpsc channel; your code reads them, feeds `Price` events into the calculator, and queries the calculator when it needs a TWAP. The calculator is a side-store you drive — not a pipeline stage events pass through.
 
 ```
-Pyth Hermes ─SSE─▶ PythClient ─OracleEvent─▶ your code
-                                                │  ▲
-                                    .record(..) │  │ .calculate / .calculate_preview
-                                                ▼  │
-                                          TwapCalculator
+Block Scholes ─WS─▶ BlockScholesClient ─OracleEvent─▶ your code
+                                                        │  ▲
+                                            .record(..) │  │ .calculate / .calculate_preview
+                                                        ▼  │
+                                                  TwapCalculator
 ```
 
 **Service:** the `joyride-oracle` binary runs those components and fans the feed out over WebSocket. Two independent broadcast streams reach the server:
@@ -190,22 +195,36 @@ Pyth Hermes ─SSE─▶ PythClient ─OracleEvent─▶ your code
 Price events do double duty: they're forwarded to the ordered stream *and* recorded into the calculator. The calculator itself is never on the wire path — only its sampled output (via the timer) is.
 
 ```
-                          ┌──▶ ordered broadcast ─────┐
-Pyth Hermes ─▶ PythClient ┤                            ├──▶ WS server ──▶ Gateway / Risk Engine / Dashboard
-                          └──▶ TwapCalculator ──▶ preview broadcast ─┘
-                                   ▲
-                               1s timer
+                                    ┌──▶ ordered broadcast ─────┐
+Block Scholes ─▶ BlockScholesClient ┤                            ├──▶ WS server ──▶ Gateway / Risk Engine / Dashboard
+                                    └──▶ TwapCalculator ──▶ preview broadcast ─┘
+                                             ▲
+                                         1s timer
 ```
 
 **Components:**
 
-- **`joyride-oracle-core`** (`crates/core/`) - Pyth client, TWAP calculator, in-process domain types
+- **`joyride-oracle-core`** (`crates/core/`) - Block Scholes client, retained Pyth client, TWAP calculator, in-process domain types
 - **`joyride-oracle-wire`** (`crates/wire/`) - typed wire contract for the WebSocket feed
 - **`joyride-oracle`** (`src/server.rs`, `src/main.rs`) - WebSocket server and service binary
 
-## Pyth Feed IDs
+## Block Scholes Feed
 
-| Asset | Feed ID |
+The client opens one WebSocket to `wss://prod-websocket-api.blockscholes.com/`, authenticates, and subscribes to one `index.px` batch:
+
+| Asset | `sid` / `base_asset` | `asset` | `quote_asset` |
+|-------|----------------------|---------|---------------|
+| SOL/USD | `SOL` | `spot` | `USD` |
+| BTC/USD | `BTC` | `spot` | `USD` |
+| ETH/USD | `ETH` | `spot` | `USD` |
+
+Subscriptions do not survive a dropped connection, so every reconnect re-authenticates and re-subscribes. A rejected subscribe (for example, the per-key rate limit) is handled like any other connection failure: the client backs off with jitter and reconnects. Liveness is checked two ways. Pings go out every 10s, and 12s without any frame forces a reconnect. 20s without a price also forces a reconnect.
+
+## Pyth Client
+
+`PythClient` (Hermes SSE) is kept in `joyride-oracle-core` so it can be swapped back in if a Pyth data plan is renewed: construct it in `src/main.rs` in place of `BlockScholesClient` and set `PYTH_API_KEY`. The service does not fail over to it automatically.
+
+| Asset | Pyth Feed ID |
 |-------|---------|
 | SOL/USD | `0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d` |
 | BTC/USD | `0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43` |

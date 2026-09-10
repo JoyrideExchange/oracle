@@ -1,6 +1,7 @@
 //! Joyride Oracle Service
 //!
-//! Streams price data from Pyth Network and calculates TWAPs for settlement.
+//! Streams spot index prices from Block Scholes and calculates TWAPs for
+//! settlement.
 //!
 //! # Usage
 //!
@@ -14,7 +15,8 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{info, warn};
 
 use joyride_oracle::{
-    run_server, Asset, OracleEvent, PythClient, TwapCalculator, TwapPreview, HERMES_URL,
+    run_server, Asset, BlockScholesClient, OracleEvent, TwapCalculator, TwapPreview,
+    BLOCKSCHOLES_WS_URL, DEFAULT_FREQUENCY_MS,
 };
 
 /// Assets tracked by the oracle.
@@ -48,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     let (preview_tx, _) = broadcast::channel::<TwapPreview>(PREVIEW_FANOUT_BUFFER);
     let preview_tx_clone = preview_tx.clone();
 
-    // Create channel for Pyth client events
+    // Create channel for upstream price-feed events
     let (event_tx, mut event_rx) = mpsc::channel::<OracleEvent>(256);
 
     // Create TWAP calculator
@@ -65,26 +67,41 @@ async fn main() -> anyhow::Result<()> {
     });
     info!("WebSocket server listening on {}", addr);
 
-    // Start Pyth client
-    let pyth_api_key = std::env::var("PYTH_API_KEY")
+    // Start Block Scholes client. The Pyth client is retained in
+    // joyride-oracle-core but not wired up: its data plan lapsed.
+    let api_key = std::env::var("BLOCKSCHOLES_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty());
-    if pyth_api_key.is_none() {
-        tracing::warn!(
-            "PYTH_API_KEY is not set. The public Hermes endpoint has required \
-             authentication since 2026-08-26T16:00Z and will answer 401 to \
-             every request; prices will freeze at their last cached values."
+    if api_key.is_none() {
+        warn!(
+            "BLOCKSCHOLES_API_KEY is not set. Block Scholes rejects \
+             unauthenticated connections; prices will freeze at their last \
+             cached values."
         );
     }
+    let frequency_ms = match std::env::var("BLOCKSCHOLES_FREQUENCY_MS") {
+        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse().unwrap_or_else(|_| {
+            warn!(
+                value = %raw,
+                default_ms = DEFAULT_FREQUENCY_MS,
+                "BLOCKSCHOLES_FREQUENCY_MS is not an integer; using default"
+            );
+            DEFAULT_FREQUENCY_MS
+        }),
+        _ => DEFAULT_FREQUENCY_MS,
+    };
     info!(
-        hermes_url = %HERMES_URL,
-        authenticated = pyth_api_key.is_some(),
-        "Using Hermes endpoint"
+        ws_url = %BLOCKSCHOLES_WS_URL,
+        authenticated = api_key.is_some(),
+        frequency_ms,
+        "Using Block Scholes index.px feed"
     );
-    let mut pyth_client = PythClient::new(event_tx, ASSETS.to_vec()).with_api_key(pyth_api_key);
+    let mut price_client = BlockScholesClient::new(event_tx, ASSETS.to_vec())
+        .with_api_key(api_key)
+        .with_frequency_ms(frequency_ms);
     tokio::spawn(async move {
-        if let Err(e) = pyth_client.run().await {
-            tracing::error!("Pyth client error: {}", e);
+        if let Err(e) = price_client.run().await {
+            tracing::error!("Block Scholes client error: {}", e);
         }
     });
 
@@ -120,10 +137,10 @@ async fn main() -> anyhow::Result<()> {
 
         match &event {
             OracleEvent::Connected => {
-                info!("Connected to Pyth Hermes");
+                info!("Upstream price feed live");
             }
             OracleEvent::Disconnected => {
-                warn!("Disconnected from Pyth Hermes");
+                warn!("Disconnected from upstream price feed");
             }
             OracleEvent::Price(update) => {
                 // Record for TWAP
