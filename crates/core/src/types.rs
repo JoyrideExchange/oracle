@@ -12,8 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Events produced by the oracle's in-process pipeline (Pyth ingestion,
-/// TWAP calculator, upstream connection status). Fanned out over the
+/// Events produced by the oracle's in-process pipeline (upstream price
+/// ingestion, TWAP calculator, upstream connection status). Fanned out over the
 /// internal broadcast channel to the WebSocket server and to any in-process
 /// consumer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,17 +25,18 @@ pub enum OracleEvent {
     /// Rolling TWAP preview (every few seconds).
     TwapPreview(joyride_oracle_wire::TwapPreview),
 
-    /// Upstream Pyth connection established.
+    /// Upstream price feed is live: fires on the first price received on a
+    /// connection, not on the transport handshake.
     Connected,
 
-    /// Upstream Pyth connection lost.
+    /// Upstream price-feed connection lost.
     Disconnected,
 
     /// An error occurred on the upstream connection.
     Error { message: String },
 }
 
-/// Supported assets and their Pyth feed IDs.
+/// Supported assets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Asset {
     Sol,
@@ -44,7 +45,7 @@ pub enum Asset {
 }
 
 impl Asset {
-    /// Returns the Pyth price feed ID for this asset.
+    /// Returns the Pyth price feed ID for this asset. Used by [`crate::PythClient`].
     pub fn feed_id(&self) -> &'static str {
         match self {
             Asset::Sol => "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
@@ -70,6 +71,11 @@ impl Asset {
             id if id == Asset::Eth.feed_id() => Some(Asset::Eth),
             _ => None,
         }
+    }
+
+    /// Parse an asset from its symbol (`"BTC"`, `"ETH"`, `"SOL"`).
+    pub fn from_symbol(symbol: &str) -> Option<Self> {
+        Asset::all().iter().copied().find(|a| a.symbol() == symbol)
     }
 
     /// Returns all supported assets.
