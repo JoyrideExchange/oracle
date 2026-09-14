@@ -16,7 +16,7 @@ In addition to manipulation risk, options experience gamma explosion in the fina
 
 ## Features
 
-- **Real-time spot index streaming** from the Block Scholes WebSocket API (1 update/second per asset)
+- **Real-time spot index streaming** from the Block Scholes WebSocket API (up to 1 update/second per asset at the default frequency; only changed values are sent)
 - **TWAP calculation** with rolling 30-minute window, 1-second samples
 - **Embeddable core crate** for in-process TWAP consumption
 - **WebSocket server** for broadcast/distributed deployments
@@ -130,7 +130,7 @@ while let Some(Ok(Message::Text(text))) = ws.next().await {
 
 Every broadcast message includes a top-level `timestamp` field: an RFC 3339 UTC timestamp (millisecond precision) recorded at the moment the server serialized the payload. Use it to measure end-to-end freshness — compare against `publish_time` on `price` events for upstream-to-client latency.
 
-**`price`** - Real-time spot index price from Block Scholes (one per asset per second)
+**`price`** - Real-time spot index price from Block Scholes (up to one per asset per second at the default frequency; only changed values are sent)
 ```json
 {
   "timestamp": "2026-04-20T12:34:56.789Z",
@@ -218,7 +218,7 @@ The client opens one WebSocket to `wss://prod-websocket-api.blockscholes.com/`, 
 | BTC/USD | `BTC` | `spot` | `USD` |
 | ETH/USD | `ETH` | `spot` | `USD` |
 
-Subscriptions do not survive a dropped connection, so every reconnect re-authenticates and re-subscribes. A rejected subscribe (for example, the per-key rate limit) is handled like any other connection failure: the client backs off with jitter and reconnects. Liveness is checked two ways. Pings go out every 10s, and 12s without any frame forces a reconnect. 20s without a price also forces a reconnect.
+Subscriptions do not survive a dropped connection, so every reconnect re-authenticates and re-subscribes. A rate-limited subscribe is retried on the same connection with jittered exponential backoff; other subscribe errors fail the connection. Liveness is checked two ways. Pings go out every 10s, and 12s without any frame forces a reconnect. Each subscribed asset has its own price watchdog: 20s at the default frequency, growing to at least two subscription intervals when a slower frequency is configured.
 
 ## Pyth Client
 

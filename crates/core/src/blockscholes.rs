@@ -16,13 +16,15 @@
 //!   FIN/RST, so without this a half-open socket wedges the client forever
 //!   on `stream.next()`.
 //! - Payload level: a connection that stays up (pongs keep flowing) but
-//!   delivers no parseable price within the stall timeout is torn down.
-//!   `OracleEvent::Connected` only fires once a price has actually arrived.
+//!   delivers no parseable price for a subscribed asset within its stall
+//!   timeout is torn down. `OracleEvent::Connected` only fires once a price
+//!   has actually arrived.
 //!
 //! Subscribe calls are rate-limited per API key, and the key is shared with
-//! other Joyride services. A rejected `subscribe` is treated like any other
-//! connection failure: back off (with jitter, per Block Scholes' guidance)
-//! and reconnect.
+//! other Joyride services. A rate-limited `subscribe` is retried on the same
+//! connection with jittered exponential backoff. Other subscription errors
+//! fail the connection because retrying an unchanged invalid request cannot
+//! succeed.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -54,9 +56,9 @@ const USER_AGENT: &str = "joyride-oracle/1.0 (+ops@joyride.exchange)";
 /// keep a healthy connection alive even if prices pause.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(12);
 const PING_INTERVAL: Duration = Duration::from_secs(10);
-/// Payload-level liveness: reconnect if no parseable price arrives within
-/// this window. Prices normally arrive every second, so 20s bounds a stall
-/// to ~1% of a 30-minute TWAP window.
+/// Minimum payload-level liveness window. The effective timeout is at least
+/// two subscription intervals so slower supported frequencies do not trip the
+/// watchdog before an update can arrive.
 const DEFAULT_PRICE_STALL_TIMEOUT: Duration = Duration::from_secs(20);
 const INITIAL_RECONNECT_BACKOFF_SECS: u64 = 5;
 const MAX_RECONNECT_BACKOFF_SECS: u64 = 60;
@@ -204,6 +206,8 @@ impl BlockScholesClient {
     /// plan accepts, or every subscribe is rejected.
     pub fn with_frequency_ms(mut self, frequency_ms: u64) -> Self {
         self.frequency_ms = frequency_ms;
+        self.price_stall_timeout =
+            DEFAULT_PRICE_STALL_TIMEOUT.max(Duration::from_millis(frequency_ms.saturating_mul(2)));
         self
     }
 
@@ -335,11 +339,8 @@ impl BlockScholesClient {
 
         // ---- 2. Subscribe ----
         let symbols: Vec<&str> = self.assets.iter().map(|a| a.symbol()).collect();
-        sink.send(Message::Text(build_subscribe_frame(
-            &symbols,
-            self.frequency_ms,
-        )))
-        .await?;
+        let subscribe_frame = build_subscribe_frame(&symbols, self.frequency_ms);
+        sink.send(Message::Text(subscribe_frame.clone())).await?;
 
         // ---- 3. Stream ----
         // Mirrors the Pyth client's two states: `subscribed` (server acked
@@ -347,7 +348,20 @@ impl BlockScholesClient {
         // emitted). OracleEvent::Connected only fires on the latter.
         let mut subscribed = false;
         let mut streaming_live = false;
-        let mut price_deadline = Instant::now() + self.price_stall_timeout;
+        let mut price_deadlines = self
+            .assets
+            .iter()
+            .map(|asset| {
+                (
+                    asset.symbol().to_string(),
+                    Instant::now() + self.price_stall_timeout,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut price_watchdog_armed = !price_deadlines.is_empty();
+        let mut subscribe_retry_at = Instant::now();
+        let mut subscribe_retry_scheduled = false;
+        let mut subscribe_backoff_secs = INITIAL_RECONNECT_BACKOFF_SECS;
         let mut last_frame_at = Instant::now();
         let mut freshness_state: HashMap<String, AssetFreshnessState> = HashMap::new();
         let mut ping_ticks = tokio::time::interval(self.ping_interval);
@@ -355,6 +369,11 @@ impl BlockScholesClient {
         ping_ticks.tick().await;
 
         loop {
+            let next_price_deadline = price_deadlines
+                .values()
+                .copied()
+                .min()
+                .unwrap_or_else(Instant::now);
             tokio::select! {
                 _ = tokio::time::sleep_until(last_frame_at + self.idle_timeout) => {
                     warn!(
@@ -368,17 +387,32 @@ impl BlockScholesClient {
                         self.idle_timeout.as_millis()
                     );
                 }
-                _ = tokio::time::sleep_until(price_deadline) => {
+                _ = tokio::time::sleep_until(next_price_deadline), if price_watchdog_armed => {
+                    let now = Instant::now();
+                    let mut stalled_assets = price_deadlines
+                        .iter()
+                        .filter_map(|(symbol, deadline)| (*deadline <= now).then_some(symbol.as_str()))
+                        .collect::<Vec<_>>();
+                    stalled_assets.sort_unstable();
                     warn!(
                         stall_timeout_ms = self.price_stall_timeout.as_millis() as u64,
+                        stalled_assets = %stalled_assets.join(","),
                         subscribed,
                         streaming_live,
-                        "No price received within stall timeout; forcing reconnect"
+                        "No price received for subscribed asset within stall timeout; forcing reconnect"
                     );
                     anyhow::bail!(
-                        "Block Scholes price stall for {}ms",
-                        self.price_stall_timeout.as_millis()
+                        "Block Scholes price stall for {}ms: {}",
+                        self.price_stall_timeout.as_millis(),
+                        stalled_assets.join(",")
                     );
+                }
+                _ = tokio::time::sleep_until(subscribe_retry_at), if subscribe_retry_scheduled => {
+                    sink.send(Message::Text(subscribe_frame.clone())).await?;
+                    subscribe_retry_scheduled = false;
+                    reset_price_deadlines(&mut price_deadlines, self.price_stall_timeout);
+                    price_watchdog_armed = !price_deadlines.is_empty();
+                    debug!("Retried Block Scholes subscription; awaiting acknowledgement");
                 }
                 _ = ping_ticks.tick() => {
                     sink.send(Message::Ping(Vec::new())).await?;
@@ -416,16 +450,31 @@ impl BlockScholesClient {
                     };
 
                     if let Some(err) = rpc.error {
-                        // Covers subscribe rejections, including the
-                        // per-key rate limit. Reconnecting re-sends the
-                        // same three-item subscribe after backoff, which
-                        // is what Block Scholes recommends for retries.
                         error!(
                             id = ?rpc.id,
                             code = err.code,
                             message = %err.message,
                             "Block Scholes returned a JSON-RPC error"
                         );
+
+                        // Block Scholes' token bucket is shared across all
+                        // connections for an API key. Their guidance is to
+                        // keep this connection and retry only the rejected
+                        // subscribe; reconnecting does not bypass the limit
+                        // and needlessly repeats authentication.
+                        if !subscribed && !streaming_live && is_rate_limit_error(&err) {
+                            let delay = jittered_backoff(subscribe_backoff_secs, jitter_seed());
+                            subscribe_retry_at = Instant::now() + delay;
+                            subscribe_retry_scheduled = true;
+                            price_watchdog_armed = false;
+                            warn!(
+                                backoff_ms = delay.as_millis() as u64,
+                                "Block Scholes rate-limited subscription; retrying on the same connection"
+                            );
+                            subscribe_backoff_secs = next_backoff_secs(subscribe_backoff_secs);
+                            continue;
+                        }
+
                         anyhow::bail!(
                             "Block Scholes rejected request: code={} {}",
                             err.code,
@@ -437,6 +486,10 @@ impl BlockScholesClient {
                         if rpc.result.is_some() && !subscribed {
                             debug!("Block Scholes subscription acknowledged; awaiting first price");
                             subscribed = true;
+                            subscribe_retry_scheduled = false;
+                            subscribe_backoff_secs = INITIAL_RECONNECT_BACKOFF_SECS;
+                            reset_price_deadlines(&mut price_deadlines, self.price_stall_timeout);
+                            price_watchdog_armed = !price_deadlines.is_empty();
                         }
                         continue;
                     }
@@ -463,7 +516,14 @@ impl BlockScholesClient {
                                 let _ = self.event_tx.send(OracleEvent::Connected).await;
                                 streaming_live = true;
                             }
-                            price_deadline = Instant::now() + self.price_stall_timeout;
+                            subscribed = true;
+                            subscribe_retry_scheduled = false;
+                            subscribe_backoff_secs = INITIAL_RECONNECT_BACKOFF_SECS;
+                            price_deadlines.insert(
+                                price_update.symbol.clone(),
+                                Instant::now() + self.price_stall_timeout,
+                            );
+                            price_watchdog_armed = true;
 
                             let receive_time_ms = unix_now_ms();
                             let now = Instant::now();
@@ -581,6 +641,21 @@ fn unix_now_ms() -> i64 {
 
 fn next_backoff_secs(current: u64) -> u64 {
     (current.saturating_mul(2)).min(MAX_RECONNECT_BACKOFF_SECS)
+}
+
+fn is_rate_limit_error(error: &RpcError) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    message.contains("rate limit")
+        || message.contains("rate-limit")
+        || message.contains("too many request")
+        || message.contains("token bucket")
+}
+
+fn reset_price_deadlines(deadlines: &mut HashMap<String, Instant>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    for asset_deadline in deadlines.values_mut() {
+        *asset_deadline = deadline;
+    }
 }
 
 /// Clock-derived jitter source. Only needs to de-synchronise our reconnects
@@ -708,6 +783,25 @@ mod tests {
     }
 
     #[test]
+    fn slower_frequency_extends_price_stall_timeout() {
+        let (tx, _rx) = mpsc::channel(1);
+        let client = BlockScholesClient::new(tx, vec![Asset::Btc]).with_frequency_ms(60_000);
+        assert_eq!(client.price_stall_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn classifies_only_rate_limit_errors_as_retryable() {
+        let error = |message: &str| RpcError {
+            code: -2610,
+            message: message.to_string(),
+        };
+        assert!(is_rate_limit_error(&error("Rate limit exceeded")));
+        assert!(is_rate_limit_error(&error("Too Many Requests")));
+        assert!(!is_rate_limit_error(&error("Invalid API Key")));
+        assert!(!is_rate_limit_error(&error("invalid frequency: 500ms")));
+    }
+
+    #[test]
     fn jittered_backoff_stays_within_25_percent() {
         assert_eq!(jittered_backoff(5, 0), Duration::from_secs(5));
         assert_eq!(jittered_backoff(5, 1_250), Duration::from_millis(6_250));
@@ -752,6 +846,10 @@ mod tests {
 
     async fn send_json(ws: &mut ServerWs, value: Value) {
         ws.send(Message::Text(value.to_string())).await.unwrap();
+    }
+
+    async fn send_json_if_open(ws: &mut ServerWs, value: Value) -> Result<(), tungstenite::Error> {
+        ws.send(Message::Text(value.to_string())).await
     }
 
     /// Accept auth and subscribe, asserting the client sent our key.
@@ -880,6 +978,106 @@ mod tests {
             .to_string();
         assert!(err.contains("invalid frequency"), "{err}");
         assert!(drain(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn rate_limited_subscribe_retries_on_same_connection() {
+        let url = spawn_mock(|mut ws| async move {
+            let auth = recv_json(&mut ws).await;
+            send_json(
+                &mut ws,
+                json!({"jsonrpc": "2.0", "result": "ok", "id": auth["id"]}),
+            )
+            .await;
+
+            let first_subscribe = recv_json(&mut ws).await;
+            send_json(
+                &mut ws,
+                json!({
+                    "jsonrpc": "2.0",
+                    "error": {"message": "Rate limit exceeded", "code": -2610},
+                    "id": first_subscribe["id"],
+                }),
+            )
+            .await;
+
+            let retried_subscribe = recv_json(&mut ws).await;
+            assert_eq!(retried_subscribe, first_subscribe);
+            send_json(
+                &mut ws,
+                json!({"jsonrpc": "2.0", "result": [{}], "id": retried_subscribe["id"]}),
+            )
+            .await;
+            send_json(
+                &mut ws,
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "subscription",
+                    "params": [{
+                        "data": {
+                            "values": [{"sid": "BTC", "v": 77237.2, "s": 0.049}],
+                            "timestamp": 1_789_074_000_000_i64,
+                        },
+                        "client_id": CLIENT_ID,
+                    }],
+                }),
+            )
+            .await;
+            ws.close(None).await.unwrap();
+        })
+        .await;
+
+        let (mut client, mut rx) = client(&url);
+        tokio::time::timeout(Duration::from_secs(8), client.connect_and_stream())
+            .await
+            .expect("rate-limit retry should complete within the first backoff window")
+            .expect("connection should close gracefully after the retry succeeds");
+
+        let events = drain(&mut rx);
+        assert!(matches!(events.first(), Some(OracleEvent::Connected)));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, OracleEvent::Price(update) if update.symbol == "BTC")));
+    }
+
+    #[tokio::test]
+    async fn one_live_asset_does_not_mask_another_asset_stall() {
+        let url = spawn_mock(|mut ws| async move {
+            handshake(&mut ws).await;
+            for timestamp in 0..10 {
+                if send_json_if_open(
+                    &mut ws,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "subscription",
+                        "params": [{
+                            "data": {
+                                "values": [{"sid": "BTC", "v": 77237.2 + timestamp as f64}],
+                                "timestamp": 1_789_074_000_000_i64 + timestamp * 50,
+                            },
+                            "client_id": CLIENT_ID,
+                        }],
+                    }),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+
+        let (client, _rx) = client(&url);
+        let mut client = client.with_timeouts(
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        );
+        let err = client.connect_and_stream().await.unwrap_err().to_string();
+        assert!(err.contains("price stall"), "{err}");
+        assert!(err.ends_with(": ETH"), "{err}");
     }
 
     /// The 2026-04-24 Hermes outage shape: the connection is healthy at
