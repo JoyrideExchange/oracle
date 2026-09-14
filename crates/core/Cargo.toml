@@ -24,7 +24,8 @@ futures-util = "0.3"
 tracing = "0.1"
 
 [dev-dependencies]
-# Test-only tokio surface: macros for #[tokio::test], rt for the runtime,
-# net + io-util for the hand-rolled SSE server in stall-watchdog tests.
+# Test-only tokio surface: rt for #[tokio::test]'s runtime, net + io-util
+# for the hand-rolled SSE and WebSocket mock servers. (`macros` is also a
+# normal dependency now: the Block Scholes client uses `select!`.)
 tokio = { version = "1", features = ["sync", "time", "macros", "rt", "net", "io-util"] }
 httpmock = "0.7"

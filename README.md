@@ -43,7 +43,7 @@ To run the standalone WebSocket service locally, see [Service Usage](#service-us
 |---------------------|---------|-------------|
 | `ORACLE_BIND_ADDR` | `0.0.0.0:8083` | WebSocket server bind address |
 | `BLOCKSCHOLES_API_KEY` | _(none)_ | Block Scholes API key, sent in the JSON-RPC `authenticate` call after connect. Required. Unset or rejected, the oracle warns, serves its last cached prices, and reconnect-loops with backoff up to 60s. The key's subscribe rate limit is shared by every connection using it. |
-| `BLOCKSCHOLES_FREQUENCY_MS` | `1000` | Subscription `frequency` for `index.px`. Must be a value the account's plan allows (currently `1000`, `20000`, or `60000`); any other value is rejected at subscribe time and the oracle reconnect-loops with the rejection logged. |
+| `BLOCKSCHOLES_FREQUENCY_MS` | `1000` | Subscription `frequency` for `index.px`. The service currently requires `1000` so its one-second TWAP sampling target remains achievable. Any other integer causes startup to fail; a non-integer value (for example `1000ms`) logs a warning and falls back to `1000`. |
 
 ## Integration
 
@@ -218,7 +218,7 @@ The client opens one WebSocket to `wss://prod-websocket-api.blockscholes.com/`, 
 | BTC/USD | `BTC` | `spot` | `USD` |
 | ETH/USD | `ETH` | `spot` | `USD` |
 
-Subscriptions do not survive a dropped connection, so every reconnect re-authenticates and re-subscribes. A rate-limited subscribe is retried on the same connection with jittered exponential backoff; other subscribe errors fail the connection. Liveness is checked two ways. Pings go out every 10s, and 12s without any frame forces a reconnect. Each subscribed asset has its own price watchdog: 20s at the default frequency, growing to at least two subscription intervals when a slower frequency is configured.
+Subscriptions do not survive a dropped connection, so every reconnect re-authenticates and re-subscribes. A rate-limited subscribe is retried on the same connection with jittered exponential backoff; other subscribe errors fail the connection. Liveness is checked two ways. Pings go out every 10s, and 12s without any frame forces a reconnect. At the service's 1-second frequency, 20s without an advancing, clock-valid price forces a reconnect.
 
 ## Pyth Client
 

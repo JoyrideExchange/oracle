@@ -29,6 +29,28 @@ fn server_addr() -> String {
     std::env::var("ORACLE_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8083".to_string())
 }
 
+fn blockscholes_frequency_ms() -> anyhow::Result<u64> {
+    let frequency_ms = match std::env::var("BLOCKSCHOLES_FREQUENCY_MS") {
+        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse().unwrap_or_else(|_| {
+            warn!(
+                value = %raw,
+                default_ms = DEFAULT_FREQUENCY_MS,
+                "BLOCKSCHOLES_FREQUENCY_MS is not an integer; using default"
+            );
+            DEFAULT_FREQUENCY_MS
+        }),
+        _ => DEFAULT_FREQUENCY_MS,
+    };
+    if frequency_ms != DEFAULT_FREQUENCY_MS {
+        anyhow::bail!(
+            "BLOCKSCHOLES_FREQUENCY_MS must be {} for one-second TWAP sampling (got {})",
+            DEFAULT_FREQUENCY_MS,
+            frequency_ms
+        );
+    }
+    Ok(frequency_ms)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().init();
@@ -42,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    let frequency_ms = blockscholes_frequency_ms()?;
 
     // Split ordered oracle traffic from latest-state preview traffic so
     // preview fanout can never displace price delivery.
@@ -79,17 +102,6 @@ async fn main() -> anyhow::Result<()> {
              cached values."
         );
     }
-    let frequency_ms = match std::env::var("BLOCKSCHOLES_FREQUENCY_MS") {
-        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse().unwrap_or_else(|_| {
-            warn!(
-                value = %raw,
-                default_ms = DEFAULT_FREQUENCY_MS,
-                "BLOCKSCHOLES_FREQUENCY_MS is not an integer; using default"
-            );
-            DEFAULT_FREQUENCY_MS
-        }),
-        _ => DEFAULT_FREQUENCY_MS,
-    };
     info!(
         ws_url = %BLOCKSCHOLES_WS_URL,
         authenticated = api_key.is_some(),
