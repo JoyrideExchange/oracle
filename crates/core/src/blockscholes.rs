@@ -15,10 +15,10 @@
 //!   [`IDLE_TIMEOUT`] is torn down. Railway drops idle-looking flows without
 //!   FIN/RST, so without this a half-open socket wedges the client forever
 //!   on `stream.next()`.
-//! - Payload level: a connection that stays up (pongs keep flowing) but
-//!   delivers no parseable, advancing, clock-valid price within its stall
-//!   timeout is torn down. `OracleEvent::Connected` only fires once such a
-//!   price has actually arrived.
+//! - Payload level: each asset is tracked independently. A stalled asset emits
+//!   one error per episode without interrupting healthy assets; the connection
+//!   is torn down when every subscribed asset has stalled. `OracleEvent::Connected`
+//!   only fires once a parseable, advancing, clock-valid price has arrived.
 //!
 //! Subscribe calls are rate-limited per API key, and the key is shared with
 //! other Joyride services. A rate-limited `subscribe` is retried on the same
@@ -26,7 +26,7 @@
 //! fail the connection because retrying an unchanged invalid request cannot
 //! succeed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -361,8 +361,9 @@ impl BlockScholesClient {
         // emitted). OracleEvent::Connected only fires on the latter.
         let mut subscribed = false;
         let mut streaming_live = false;
-        let mut price_deadline = Instant::now() + self.price_stall_timeout;
-        let mut price_watchdog_armed = !self.assets.is_empty();
+        let mut price_deadlines = new_price_deadlines(&self.assets, self.price_stall_timeout);
+        let mut stalled_assets = HashSet::new();
+        let mut price_watchdog_armed = !price_deadlines.is_empty();
         let mut subscribe_retry_at = Instant::now();
         let mut subscribe_retry_scheduled = false;
         let mut subscribe_backoff_secs = INITIAL_RECONNECT_BACKOFF_SECS;
@@ -373,6 +374,12 @@ impl BlockScholesClient {
         ping_ticks.tick().await;
 
         loop {
+            let next_price_deadline = price_deadlines
+                .iter()
+                .filter(|(symbol, _)| !stalled_assets.contains(*symbol))
+                .map(|(_, deadline)| *deadline)
+                .min()
+                .unwrap_or_else(Instant::now);
             tokio::select! {
                 _ = tokio::time::sleep_until(last_frame_at + self.idle_timeout) => {
                     warn!(
@@ -386,23 +393,52 @@ impl BlockScholesClient {
                         self.idle_timeout.as_millis()
                     );
                 }
-                _ = tokio::time::sleep_until(price_deadline), if price_watchdog_armed => {
-                    warn!(
-                        stall_timeout_ms = self.price_stall_timeout.as_millis() as u64,
-                        subscribed,
-                        streaming_live,
-                        "No advancing price received within stall timeout; forcing reconnect"
-                    );
-                    anyhow::bail!(
-                        "Block Scholes price stall for {}ms",
-                        self.price_stall_timeout.as_millis()
-                    );
+                _ = tokio::time::sleep_until(next_price_deadline), if price_watchdog_armed => {
+                    let now = Instant::now();
+                    let newly_stalled = price_deadlines
+                        .iter()
+                        .filter_map(|(symbol, deadline)| {
+                            (*deadline <= now && !stalled_assets.contains(symbol))
+                                .then_some(symbol.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    stalled_assets.extend(newly_stalled.iter().cloned());
+
+                    if stalled_assets.len() == price_deadlines.len() {
+                        warn!(
+                            stall_timeout_ms = self.price_stall_timeout.as_millis() as u64,
+                            subscribed,
+                            streaming_live,
+                            "No advancing prices received within stall timeout; forcing reconnect"
+                        );
+                        anyhow::bail!(
+                            "Block Scholes price stall for {}ms",
+                            self.price_stall_timeout.as_millis()
+                        );
+                    }
+
+                    for symbol in newly_stalled {
+                        warn!(
+                            asset = %symbol,
+                            stall_timeout_ms = self.price_stall_timeout.as_millis() as u64,
+                            "Block Scholes asset price stalled; keeping healthy assets connected"
+                        );
+                        let _ = self.event_tx.send(OracleEvent::Error {
+                            message: format!(
+                                "Block Scholes price stall for {}: no advancing price for {}ms",
+                                symbol,
+                                self.price_stall_timeout.as_millis()
+                            ),
+                        }).await;
+                    }
+                    price_watchdog_armed = stalled_assets.len() < price_deadlines.len();
                 }
                 _ = tokio::time::sleep_until(subscribe_retry_at), if subscribe_retry_scheduled => {
                     sink.send(Message::Text(subscribe_frame.clone())).await?;
                     subscribe_retry_scheduled = false;
-                    price_deadline = Instant::now() + self.price_stall_timeout;
-                    price_watchdog_armed = !self.assets.is_empty();
+                    reset_price_deadlines(&mut price_deadlines, self.price_stall_timeout);
+                    stalled_assets.clear();
+                    price_watchdog_armed = !price_deadlines.is_empty();
                     debug!("Retried Block Scholes subscription; awaiting acknowledgement");
                 }
                 _ = ping_ticks.tick() => {
@@ -498,8 +534,9 @@ impl BlockScholesClient {
                             subscribed = true;
                             subscribe_retry_scheduled = false;
                             subscribe_backoff_secs = INITIAL_RECONNECT_BACKOFF_SECS;
-                            price_deadline = Instant::now() + self.price_stall_timeout;
-                            price_watchdog_armed = !self.assets.is_empty();
+                            reset_price_deadlines(&mut price_deadlines, self.price_stall_timeout);
+                            stalled_assets.clear();
+                            price_watchdog_armed = !price_deadlines.is_empty();
                         }
                         continue;
                     }
@@ -540,7 +577,7 @@ impl BlockScholesClient {
                             let observation = state.observe(timestamp_ms, receive_time_ms);
                             let abnormal = !observation.timestamp_advanced;
 
-                            if abnormal {
+                            if abnormal && state.should_emit_sample(now) {
                                 warn!(
                                     asset = %price_update.symbol,
                                     timestamp_ms,
@@ -551,6 +588,7 @@ impl BlockScholesClient {
                                     stale_streak = observation.stale_streak,
                                     "blockscholes_freshness_abnormal"
                                 );
+                                state.mark_logged(now);
                             } else if state.should_emit_sample(now) {
                                 info!(
                                     asset = %price_update.symbol,
@@ -578,8 +616,17 @@ impl BlockScholesClient {
                             subscribed = true;
                             subscribe_retry_scheduled = false;
                             subscribe_backoff_secs = INITIAL_RECONNECT_BACKOFF_SECS;
-                            price_deadline = Instant::now() + self.price_stall_timeout;
-                            price_watchdog_armed = true;
+                            if stalled_assets.remove(&price_update.symbol) {
+                                info!(
+                                    asset = %price_update.symbol,
+                                    "Block Scholes asset price recovered"
+                                );
+                            }
+                            price_deadlines.insert(
+                                price_update.symbol.clone(),
+                                Instant::now() + self.price_stall_timeout,
+                            );
+                            price_watchdog_armed = stalled_assets.len() < price_deadlines.len();
 
                             if let Err(e) = self.event_tx.send(OracleEvent::Price(price_update)).await {
                                 error!("Failed to send price update: {}", e);
@@ -687,6 +734,21 @@ fn response_id_matches(id: &Option<Value>, expected: u64) -> bool {
         Some(Value::Number(number)) => number.as_u64() == Some(expected),
         Some(Value::String(value)) => value.parse::<u64>().ok() == Some(expected),
         Some(_) => false,
+    }
+}
+
+fn new_price_deadlines(assets: &[Asset], timeout: Duration) -> HashMap<String, Instant> {
+    let deadline = Instant::now() + timeout;
+    assets
+        .iter()
+        .map(|asset| (asset.symbol().to_string(), deadline))
+        .collect()
+}
+
+fn reset_price_deadlines(deadlines: &mut HashMap<String, Instant>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    for asset_deadline in deadlines.values_mut() {
+        *asset_deadline = deadline;
     }
 }
 
@@ -1113,6 +1175,65 @@ mod tests {
 
         let events = drain(&mut rx);
         assert!(matches!(events.first(), Some(OracleEvent::Connected)));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, OracleEvent::Price(update) if update.symbol == "BTC")));
+    }
+
+    #[tokio::test]
+    async fn one_live_asset_reports_another_asset_stall_without_reconnecting() {
+        let url = spawn_mock(|mut ws| async move {
+            handshake(&mut ws).await;
+            let started_ms = unix_now_ms();
+            for tick in 0..12 {
+                let result = ws
+                    .send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "subscription",
+                            "params": [{
+                                "data": {
+                                    "values": [{"sid": "BTC", "v": 77237.2 + tick as f64}],
+                                    "timestamp": started_ms + tick * 50,
+                                },
+                                "client_id": CLIENT_ID,
+                            }],
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+                if result.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let _ = ws.close(None).await;
+        })
+        .await;
+
+        let (client, mut rx) = client(&url);
+        let mut client = client.with_timeouts(
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        );
+        tokio::time::timeout(Duration::from_secs(2), client.connect_and_stream())
+            .await
+            .expect("healthy BTC updates should keep the connection open")
+            .expect("peer close after live prices should be graceful");
+
+        let events = drain(&mut rx);
+        let eth_stalls = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    OracleEvent::Error { message }
+                        if message.contains("price stall for ETH")
+                )
+            })
+            .count();
+        assert_eq!(eth_stalls, 1, "{events:?}");
         assert!(events
             .iter()
             .any(|event| matches!(event, OracleEvent::Price(update) if update.symbol == "BTC")));
