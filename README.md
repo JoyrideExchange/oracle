@@ -165,7 +165,7 @@ Every broadcast message includes a top-level `timestamp` field: an RFC 3339 UTC 
 }
 ```
 
-**`connected`** / **`disconnected`** / **`error`** - Status of the oracle's upstream connection to Block Scholes, not the consumer's connection to this server. `connected` fires when the first price arrives on a new upstream connection, not on the transport handshake. Emitted on upstream state transitions (edge-triggered, not replayed to new subscribers). The `error` payload carries a `message` field with the upstream error string. All three carry `timestamp`.
+**`connected`** / **`disconnected`** / **`error`** - Status of the oracle's upstream feed from Block Scholes, not the consumer's connection to this server. `connected` fires when the first price arrives on a new upstream connection, not on the transport handshake. Emitted on upstream state transitions (edge-triggered, not replayed to new subscribers). An `error` can report either a connection-wide failure or one stalled asset while the connection and other assets remain healthy; its `message` identifies the failure. All three carry `timestamp`.
 
 ## TWAP Details
 

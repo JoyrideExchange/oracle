@@ -77,7 +77,7 @@ pub enum WirePayload {
     /// Upstream price-feed connection lost.
     Disconnected,
 
-    /// An error occurred on the upstream connection.
+    /// An upstream connection-wide error or a stall affecting one asset.
     Error { message: String },
 
     /// WebSocket keepalive; emitted by the server on a fixed interval.
