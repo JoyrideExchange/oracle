@@ -43,7 +43,7 @@ To run the standalone WebSocket service locally, see [Service Usage](#service-us
 |---------------------|---------|-------------|
 | `ORACLE_BIND_ADDR` | `0.0.0.0:8083` | WebSocket server bind address |
 | `BLOCKSCHOLES_API_KEY` | _(none)_ | Block Scholes API key, sent in the JSON-RPC `authenticate` call after connect. Required. Unset or rejected, the oracle warns, serves its last cached prices, and reconnect-loops with backoff up to 60s. The key's subscribe rate limit is shared by every connection using it. |
-| `BLOCKSCHOLES_FREQUENCY_MS` | `1000` | Subscription `frequency` for `index.px`. The service currently requires `1000` so its one-second TWAP sampling target remains achievable. Any other integer causes startup to fail; a non-integer value (for example `1000ms`) logs a warning and falls back to `1000`. |
+| `BLOCKSCHOLES_FREQUENCY_MS` | `1000` | Subscription `frequency` for `index.px`, in milliseconds. Must be a whole number from `1` to `1000`: the TWAP samples once per second, so a slower value fails startup, as does a malformed one (for example `1000ms`). A faster value must also be one the account's plan allows (today only `1000`, `20000`, and `60000`, so in practice `1000`). Block Scholes rejects any other value at subscribe time, and the oracle then reconnect-loops with the rejection logged while prices stay frozen. |
 
 ## Integration
 

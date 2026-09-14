@@ -29,23 +29,37 @@ fn server_addr() -> String {
     std::env::var("ORACLE_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8083".to_string())
 }
 
+/// Slowest Block Scholes subscription frequency the service accepts. The TWAP
+/// samples once per second, so anything slower leaves seconds unsampled.
+/// Faster rates are fine: the calculator keeps one sample per second.
+const MAX_FREQUENCY_MS: u64 = 1_000;
+
 fn blockscholes_frequency_ms() -> anyhow::Result<u64> {
-    let frequency_ms = match std::env::var("BLOCKSCHOLES_FREQUENCY_MS") {
-        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse().unwrap_or_else(|_| {
-            warn!(
-                value = %raw,
-                default_ms = DEFAULT_FREQUENCY_MS,
-                "BLOCKSCHOLES_FREQUENCY_MS is not an integer; using default"
-            );
-            DEFAULT_FREQUENCY_MS
-        }),
-        _ => DEFAULT_FREQUENCY_MS,
+    match std::env::var("BLOCKSCHOLES_FREQUENCY_MS") {
+        Ok(raw) => parse_frequency_ms(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => parse_frequency_ms(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("BLOCKSCHOLES_FREQUENCY_MS is not valid UTF-8")
+        }
+    }
+}
+
+/// Parse `BLOCKSCHOLES_FREQUENCY_MS`. Unset or blank means the default; a
+/// malformed, zero, or slower-than-one-second value fails startup. Whether a
+/// faster value is allowed is the account plan's call, made at subscribe time.
+fn parse_frequency_ms(raw: Option<&str>) -> anyhow::Result<u64> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(DEFAULT_FREQUENCY_MS);
     };
-    if frequency_ms != DEFAULT_FREQUENCY_MS {
+    let frequency_ms: u64 = raw.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "BLOCKSCHOLES_FREQUENCY_MS must be a whole number of milliseconds (got {raw:?})"
+        )
+    })?;
+    if frequency_ms == 0 || frequency_ms > MAX_FREQUENCY_MS {
         anyhow::bail!(
-            "BLOCKSCHOLES_FREQUENCY_MS must be {} for one-second TWAP sampling (got {})",
-            DEFAULT_FREQUENCY_MS,
-            frequency_ms
+            "BLOCKSCHOLES_FREQUENCY_MS must be between 1 and {MAX_FREQUENCY_MS} for one-second \
+             TWAP sampling (got {frequency_ms})"
         );
     }
     Ok(frequency_ms)
@@ -188,4 +202,43 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frequency_defaults_when_unset_or_blank() {
+        assert_eq!(parse_frequency_ms(None).unwrap(), DEFAULT_FREQUENCY_MS);
+        assert_eq!(parse_frequency_ms(Some("")).unwrap(), DEFAULT_FREQUENCY_MS);
+        assert_eq!(
+            parse_frequency_ms(Some("  ")).unwrap(),
+            DEFAULT_FREQUENCY_MS
+        );
+    }
+
+    #[test]
+    fn frequency_accepts_one_second_or_faster() {
+        assert_eq!(parse_frequency_ms(Some("1000")).unwrap(), 1_000);
+        assert_eq!(parse_frequency_ms(Some(" 1000 ")).unwrap(), 1_000);
+        assert_eq!(parse_frequency_ms(Some("500")).unwrap(), 500);
+        assert_eq!(parse_frequency_ms(Some("1")).unwrap(), 1);
+    }
+
+    #[test]
+    fn frequency_rejects_slower_than_one_second_and_zero() {
+        for raw in ["1001", "20000", "60000", "0"] {
+            let err = parse_frequency_ms(Some(raw)).unwrap_err().to_string();
+            assert!(err.contains("between 1 and 1000"), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn frequency_rejects_malformed_values_instead_of_falling_back() {
+        for raw in ["1000ms", "1s", "1_000", "-1", "1e3", "abc"] {
+            let err = parse_frequency_ms(Some(raw)).unwrap_err().to_string();
+            assert!(err.contains("whole number of milliseconds"), "{raw}: {err}");
+        }
+    }
 }
