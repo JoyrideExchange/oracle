@@ -1,6 +1,7 @@
 //! Joyride Oracle Service
 //!
-//! Streams price data from Pyth Network and calculates TWAPs for settlement.
+//! Streams spot index prices from Block Scholes and calculates TWAPs for
+//! settlement.
 //!
 //! # Usage
 //!
@@ -14,7 +15,8 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{info, warn};
 
 use joyride_oracle::{
-    run_server, Asset, OracleEvent, PythClient, TwapCalculator, TwapPreview, HERMES_URL,
+    run_server, Asset, BlockScholesClient, OracleEvent, TwapCalculator, TwapPreview,
+    BLOCKSCHOLES_WS_URL, DEFAULT_FREQUENCY_MS,
 };
 
 /// Assets tracked by the oracle.
@@ -25,6 +27,42 @@ const PREVIEW_FANOUT_BUFFER: usize = 2048;
 /// WebSocket server address (0.0.0.0 for Docker/production).
 fn server_addr() -> String {
     std::env::var("ORACLE_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8083".to_string())
+}
+
+/// Slowest Block Scholes subscription frequency the service accepts. The TWAP
+/// samples once per second, so anything slower leaves seconds unsampled.
+/// Faster rates are fine: the calculator keeps one sample per second.
+const MAX_FREQUENCY_MS: u64 = 1_000;
+
+fn blockscholes_frequency_ms() -> anyhow::Result<u64> {
+    match std::env::var("BLOCKSCHOLES_FREQUENCY_MS") {
+        Ok(raw) => parse_frequency_ms(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => parse_frequency_ms(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("BLOCKSCHOLES_FREQUENCY_MS is not valid UTF-8")
+        }
+    }
+}
+
+/// Parse `BLOCKSCHOLES_FREQUENCY_MS`. Unset or blank means the default; a
+/// malformed, zero, or slower-than-one-second value fails startup. Whether a
+/// faster value is allowed is the account plan's call, made at subscribe time.
+fn parse_frequency_ms(raw: Option<&str>) -> anyhow::Result<u64> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(DEFAULT_FREQUENCY_MS);
+    };
+    let frequency_ms: u64 = raw.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "BLOCKSCHOLES_FREQUENCY_MS must be a whole number of milliseconds (got {raw:?})"
+        )
+    })?;
+    if frequency_ms == 0 || frequency_ms > MAX_FREQUENCY_MS {
+        anyhow::bail!(
+            "BLOCKSCHOLES_FREQUENCY_MS must be between 1 and {MAX_FREQUENCY_MS} for one-second \
+             TWAP sampling (got {frequency_ms})"
+        );
+    }
+    Ok(frequency_ms)
 }
 
 #[tokio::main]
@@ -40,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    let frequency_ms = blockscholes_frequency_ms()?;
 
     // Split ordered oracle traffic from latest-state preview traffic so
     // preview fanout can never displace price delivery.
@@ -48,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     let (preview_tx, _) = broadcast::channel::<TwapPreview>(PREVIEW_FANOUT_BUFFER);
     let preview_tx_clone = preview_tx.clone();
 
-    // Create channel for Pyth client events
+    // Create channel for upstream price-feed events
     let (event_tx, mut event_rx) = mpsc::channel::<OracleEvent>(256);
 
     // Create TWAP calculator
@@ -65,26 +104,30 @@ async fn main() -> anyhow::Result<()> {
     });
     info!("WebSocket server listening on {}", addr);
 
-    // Start Pyth client
-    let pyth_api_key = std::env::var("PYTH_API_KEY")
+    // Start Block Scholes client. The Pyth client is retained in
+    // joyride-oracle-core but not wired up: its data plan lapsed.
+    let api_key = std::env::var("BLOCKSCHOLES_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty());
-    if pyth_api_key.is_none() {
-        tracing::warn!(
-            "PYTH_API_KEY is not set. The public Hermes endpoint has required \
-             authentication since 2026-08-26T16:00Z and will answer 401 to \
-             every request; prices will freeze at their last cached values."
+    if api_key.is_none() {
+        warn!(
+            "BLOCKSCHOLES_API_KEY is not set. Block Scholes rejects \
+             unauthenticated connections; prices will freeze at their last \
+             cached values."
         );
     }
     info!(
-        hermes_url = %HERMES_URL,
-        authenticated = pyth_api_key.is_some(),
-        "Using Hermes endpoint"
+        ws_url = %BLOCKSCHOLES_WS_URL,
+        authenticated = api_key.is_some(),
+        frequency_ms,
+        "Using Block Scholes index.px feed"
     );
-    let mut pyth_client = PythClient::new(event_tx, ASSETS.to_vec()).with_api_key(pyth_api_key);
+    let mut price_client = BlockScholesClient::new(event_tx, ASSETS.to_vec())
+        .with_api_key(api_key)
+        .with_frequency_ms(frequency_ms);
     tokio::spawn(async move {
-        if let Err(e) = pyth_client.run().await {
-            tracing::error!("Pyth client error: {}", e);
+        if let Err(e) = price_client.run().await {
+            tracing::error!("Block Scholes client error: {}", e);
         }
     });
 
@@ -120,10 +163,10 @@ async fn main() -> anyhow::Result<()> {
 
         match &event {
             OracleEvent::Connected => {
-                info!("Connected to Pyth Hermes");
+                info!("Upstream price feed live");
             }
             OracleEvent::Disconnected => {
-                warn!("Disconnected from Pyth Hermes");
+                warn!("Disconnected from upstream price feed");
             }
             OracleEvent::Price(update) => {
                 // Record for TWAP
@@ -159,4 +202,43 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frequency_defaults_when_unset_or_blank() {
+        assert_eq!(parse_frequency_ms(None).unwrap(), DEFAULT_FREQUENCY_MS);
+        assert_eq!(parse_frequency_ms(Some("")).unwrap(), DEFAULT_FREQUENCY_MS);
+        assert_eq!(
+            parse_frequency_ms(Some("  ")).unwrap(),
+            DEFAULT_FREQUENCY_MS
+        );
+    }
+
+    #[test]
+    fn frequency_accepts_one_second_or_faster() {
+        assert_eq!(parse_frequency_ms(Some("1000")).unwrap(), 1_000);
+        assert_eq!(parse_frequency_ms(Some(" 1000 ")).unwrap(), 1_000);
+        assert_eq!(parse_frequency_ms(Some("500")).unwrap(), 500);
+        assert_eq!(parse_frequency_ms(Some("1")).unwrap(), 1);
+    }
+
+    #[test]
+    fn frequency_rejects_slower_than_one_second_and_zero() {
+        for raw in ["1001", "20000", "60000", "0"] {
+            let err = parse_frequency_ms(Some(raw)).unwrap_err().to_string();
+            assert!(err.contains("between 1 and 1000"), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn frequency_rejects_malformed_values_instead_of_falling_back() {
+        for raw in ["1000ms", "1s", "1_000", "-1", "1e3", "abc"] {
+            let err = parse_frequency_ms(Some(raw)).unwrap_err().to_string();
+            assert!(err.contains("whole number of milliseconds"), "{raw}: {err}");
+        }
+    }
 }

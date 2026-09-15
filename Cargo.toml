@@ -1,11 +1,12 @@
 # Cargo.toml - Oracle service for Joyride exchange
 #
-# This service provides price data from Pyth Network for:
+# This service provides spot index prices from Block Scholes for:
 # - Real-time spot prices (for risk engine consumption)
 # - TWAP calculation for settlement pricing
 #
-# Phase 0: Pyth Hermes (HTTP/SSE streaming)
-# Phase 1+: Pyth Pro (lower latency)
+# Upstream: Block Scholes index.px over WebSocket (since 2026-09).
+# Previously Pyth Hermes (HTTP/SSE); that client is retained in
+# joyride-oracle-core but not wired into the service.
 
 [workspace]
 members = [".", "crates/core", "crates/wire"]
@@ -15,7 +16,7 @@ resolver = "2"
 name = "joyride-oracle"
 version = "0.1.0"
 edition = "2021"
-description = "Price oracle service using Pyth Network"
+description = "Price oracle service: Block Scholes spot index and TWAP settlement pricing"
 license = "MIT"
 repository = "https://github.com/joyride-exchange/oracle"
 homepage = "https://joyride.exchange"
