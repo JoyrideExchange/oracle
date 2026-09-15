@@ -54,7 +54,7 @@ const USER_AGENT: &str = "joyride-oracle/1.0 (+ops@joyride.exchange)";
 /// Frame-level idle: reconnect if no frame of any kind (data, pong, ping)
 /// arrives within this window. Sized above `PING_INTERVAL` so pong replies
 /// keep a healthy connection alive even if prices pause.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(12);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// Minimum payload-level liveness window. The effective timeout is at least
 /// two subscription intervals so slower supported frequencies do not trip the
@@ -235,7 +235,8 @@ impl BlockScholesClient {
             let reconnect_reason: String;
             let result = self.connect_and_stream().await;
             let live_duration = self.session_live_since.map(|since| since.elapsed());
-            backoff_secs = reconnect_backoff_for_session(backoff_secs, live_duration);
+            backoff_secs =
+                reconnect_backoff_for_session(backoff_secs, result.is_ok(), live_duration);
 
             match result {
                 Ok(()) => {
@@ -369,6 +370,7 @@ impl BlockScholesClient {
         let mut subscribe_backoff_secs = INITIAL_RECONNECT_BACKOFF_SECS;
         let mut last_frame_at = Instant::now();
         let mut freshness_state: HashMap<String, AssetFreshnessState> = HashMap::new();
+        let mut last_timestamp_skew_log = None;
         let mut ping_ticks = tokio::time::interval(self.ping_interval);
         // Consume the immediate first tick so pings start one interval in.
         ping_ticks.tick().await;
@@ -556,13 +558,22 @@ impl BlockScholesClient {
                         let timestamp_ms = notification.data.timestamp;
                         let receive_time_ms = unix_now_ms();
                         if !timestamp_within_skew(timestamp_ms, receive_time_ms) {
-                            warn!(
-                                timestamp_ms,
-                                receive_time_ms,
-                                timestamp_skew_ms = receive_time_ms.saturating_sub(timestamp_ms),
-                                max_timestamp_skew_ms = MAX_TIMESTAMP_SKEW_MS,
-                                "Dropping Block Scholes update with out-of-range timestamp"
-                            );
+                            let now = Instant::now();
+                            let should_log = last_timestamp_skew_log
+                                .map(|last: Instant| {
+                                    now.duration_since(last) >= FRESHNESS_LOG_INTERVAL
+                                })
+                                .unwrap_or(true);
+                            if should_log {
+                                warn!(
+                                    timestamp_ms,
+                                    receive_time_ms,
+                                    timestamp_skew_ms = receive_time_ms.saturating_sub(timestamp_ms),
+                                    max_timestamp_skew_ms = MAX_TIMESTAMP_SKEW_MS,
+                                    "Dropping Block Scholes update with out-of-range timestamp"
+                                );
+                                last_timestamp_skew_log = Some(now);
+                            }
                             continue;
                         }
 
@@ -712,8 +723,14 @@ fn next_backoff_secs(current: u64) -> u64 {
     (current.saturating_mul(2)).min(MAX_RECONNECT_BACKOFF_SECS)
 }
 
-fn reconnect_backoff_for_session(current: u64, live_duration: Option<Duration>) -> u64 {
-    if live_duration.is_some_and(|duration| duration >= STABLE_SESSION_RESET_AFTER) {
+fn reconnect_backoff_for_session(
+    current: u64,
+    ended_gracefully: bool,
+    live_duration: Option<Duration>,
+) -> u64 {
+    if live_duration
+        .is_some_and(|duration| ended_gracefully || duration >= STABLE_SESSION_RESET_AFTER)
+    {
         INITIAL_RECONNECT_BACKOFF_SECS
     } else {
         current
@@ -892,16 +909,26 @@ mod tests {
     }
 
     #[test]
-    fn stable_session_resets_accumulated_reconnect_backoff() {
-        assert_eq!(reconnect_backoff_for_session(60, None), 60);
+    fn healthy_or_stable_session_resets_accumulated_reconnect_backoff() {
+        assert_eq!(reconnect_backoff_for_session(60, false, None), 60);
+        assert_eq!(reconnect_backoff_for_session(60, true, None), 60);
         assert_eq!(
-            reconnect_backoff_for_session(60, Some(Duration::from_secs(59))),
+            reconnect_backoff_for_session(60, false, Some(Duration::from_secs(59))),
             60
         );
         assert_eq!(
-            reconnect_backoff_for_session(60, Some(Duration::from_secs(60))),
+            reconnect_backoff_for_session(60, true, Some(Duration::from_secs(45))),
             INITIAL_RECONNECT_BACKOFF_SECS
         );
+        assert_eq!(
+            reconnect_backoff_for_session(60, false, Some(Duration::from_secs(60))),
+            INITIAL_RECONNECT_BACKOFF_SECS
+        );
+    }
+
+    #[test]
+    fn idle_timeout_leaves_room_for_multiple_ping_intervals() {
+        assert!(IDLE_TIMEOUT >= PING_INTERVAL.saturating_mul(2));
     }
 
     #[test]

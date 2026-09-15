@@ -32,7 +32,8 @@ pub enum OracleEvent {
     /// Upstream price-feed connection lost.
     Disconnected,
 
-    /// An error occurred on the upstream connection.
+    /// An upstream connection-wide error or a stall affecting one asset. A
+    /// subsequent price for that asset indicates recovery from an asset stall.
     Error { message: String },
 }
 

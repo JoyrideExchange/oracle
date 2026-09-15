@@ -165,7 +165,7 @@ Every broadcast message includes a top-level `timestamp` field: an RFC 3339 UTC 
 }
 ```
 
-**`connected`** / **`disconnected`** / **`error`** - Status of the oracle's upstream feed from Block Scholes, not the consumer's connection to this server. `connected` fires when the first price arrives on a new upstream connection, not on the transport handshake. Emitted on upstream state transitions (edge-triggered, not replayed to new subscribers). An `error` can report either a connection-wide failure or one stalled asset while the connection and other assets remain healthy; its `message` identifies the failure. All three carry `timestamp`.
+**`connected`** / **`disconnected`** / **`error`** - Status of the oracle's upstream feed from Block Scholes, not the consumer's connection to this server. `connected` fires when the first price arrives on a new upstream connection, not on the transport handshake. Emitted on upstream state transitions (edge-triggered, not replayed to new subscribers). An `error` can report either a connection-wide failure or one stalled asset while the connection and other assets remain healthy; its `message` identifies the failure. There is no separate per-asset recovery event: the next `price` for the affected symbol clears that stall condition. All three carry `timestamp`.
 
 ## TWAP Details
 
@@ -218,7 +218,7 @@ The client opens one WebSocket to `wss://prod-websocket-api.blockscholes.com/`, 
 | BTC/USD | `BTC` | `spot` | `USD` |
 | ETH/USD | `ETH` | `spot` | `USD` |
 
-Subscriptions do not survive a dropped connection, so every reconnect re-authenticates and re-subscribes. A rate-limited subscribe is retried on the same connection with jittered exponential backoff; other subscribe errors fail the connection. Liveness is checked two ways. Pings go out every 10s, and 12s without any frame forces a reconnect. Each asset has a 20s price deadline: a single stalled asset emits one error per episode without interrupting healthy assets, while an all-asset stall forces a reconnect.
+Subscriptions do not survive a dropped connection, so every reconnect re-authenticates and re-subscribes. A rate-limited subscribe is retried on the same connection with jittered exponential backoff; other subscribe errors fail the connection. Liveness is checked two ways. Pings go out every 10s, and 30s without any frame forces a reconnect. Each asset has a 20s price deadline: a single stalled asset emits one error per episode without interrupting healthy assets, while an all-asset stall forces a reconnect.
 
 ## Pyth Client
 
